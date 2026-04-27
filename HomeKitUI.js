@@ -1,0 +1,469 @@
+// Module: HomeKitUI
+//
+// Shared web UI module for HomeKit-enabled standalone applications.
+// Designed to provide a lightweight, Homebridge-like setup and maintenance
+// interface for accessories built using HAP-NodeJS.
+//
+// Provides a simple browser-based interface for configuring, maintaining,
+// and managing HomeKit accessories without requiring Homebridge.
+//
+// Responsibilities:
+// - Serve a local web-based configuration interface
+// - Expose config.json and config.schema.json for UI rendering
+// - Handle configuration save, validation, backup, and restore workflows
+// - Provide HomeKit pairing details (QR code, setup URI, pairing state)
+// - Support resetting HomeKit pairing data via HAP-NodeJS cleanup
+// - Provide optional hooks for restart, logging, and maintenance actions
+//
+// Architecture:
+// - Intended to be used alongside HomeKitDevice-based projects
+// - Operates at the application/bridge level (not per-device instance)
+// - UI communicates with the host application via API endpoints and hooks
+//
+// API Endpoints:
+// - GET  /api/info
+// - GET  /api/config
+// - POST /api/config
+// - GET  /api/schema
+// - GET  /api/homekit
+// - POST /api/homekit/reset
+// - POST /api/service/restart
+// - GET  /api/logs
+// - GET  /api/backup
+// - POST /api/restore
+//
+// Example:
+//
+// import HomeKitUI from './HomeKitUI.js';
+//
+// let ui = new HomeKitUI({
+//   name: 'My HomeKit App',
+//   accessory,
+//   hap,
+//   log,
+//   configFile: './config.json',
+//   schemaFile: './config.schema.json',
+//   staticPath: './ui/build',
+//
+//   onRestart: async () => process.exit(0),
+// });
+//
+// await ui.start();
+//
+// Notes:
+// - Designed for HAP-NodeJS standalone environments (not Homebridge)
+// - Does not manage accessory lifecycle or publishing directly
+// - Host application remains responsible for device creation and runtime control
+// - Resetting HomeKit pairing removes all controllers and requires re-pairing
+//
+// Mark Hulskamp
+'use strict';
+
+// Define external module requirements
+import express from 'express';
+import QRCode from 'qrcode';
+
+// Define nodejs module requirements
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+// Define constants
+const LOG_LEVELS = {
+  INFO: 'info',
+  WARN: 'warn',
+  ERROR: 'error',
+  DEBUG: 'debug',
+};
+
+// Define our HomeKit UI class
+export default class HomeKitUI {
+  static DEFAULT_PORT = 8581;
+  static VERSION = '2026.04.27';
+
+  // Internal data only for this class
+  #app = undefined; // Express app instance
+  #server = undefined; // HTTP server instance
+  #options = {}; // Runtime options
+
+  constructor(options = {}) {
+    // Options must be a plain object. If not, fall back to defaults so the class
+    // can still be constructed safely and fail later with useful endpoint errors.
+    if (options === null || typeof options !== 'object' || options.constructor !== Object) {
+      options = {};
+    }
+
+    // Store all runtime options in one internal object so the public class surface
+    // remains small. Hooks allow each standalone app to provide its own validation,
+    // saving, logging, restart, and pairing reset behaviour.
+    this.#options = {
+      name: 'HomeKit Device',
+      version: HomeKitUI.VERSION,
+      port: HomeKitUI.DEFAULT_PORT,
+      host: undefined,
+      configFile: undefined,
+      schemaFile: undefined,
+      staticPath: undefined,
+      accessory: undefined,
+      hap: undefined,
+      log: console,
+      onValidateConfig: undefined,
+      onSaveConfig: undefined,
+      onRestoreConfig: undefined,
+      onRestart: undefined,
+      onResetPairing: undefined,
+      onLogs: undefined,
+      ...options,
+    };
+  }
+
+  async start() {
+    // If the HTTP server is already running, don't bind twice. This makes start()
+    // safe to call from app initialisation code that may be retried.
+    if (this.#server !== undefined) {
+      return false;
+    }
+
+    // Create a new Express application for our API and static UI assets.
+    this.#app = express();
+
+    // Accept JSON payloads for config save/restore and maintenance actions.
+    // Limit is intentionally small since configs should not be large.
+    this.#app.use(express.json({ limit: '2mb' }));
+
+    // Register core API routes. Keep routes flat and explicit so the frontend can
+    // remain simple and the host app has a predictable API contract.
+    this.#app.get('/api/info', this.#handleInfo.bind(this));
+    this.#app.get('/api/config', this.#handleGetConfig.bind(this));
+    this.#app.post('/api/config', this.#handleSaveConfig.bind(this));
+    this.#app.get('/api/schema', this.#handleGetSchema.bind(this));
+    this.#app.get('/api/homekit', this.#handleHomeKit.bind(this));
+    this.#app.post('/api/homekit/reset', this.#handleResetPairing.bind(this));
+    this.#app.post('/api/service/restart', this.#handleRestart.bind(this));
+    this.#app.get('/api/logs', this.#handleLogs.bind(this));
+    this.#app.get('/api/backup', this.#handleBackup.bind(this));
+    this.#app.post('/api/restore', this.#handleRestore.bind(this));
+
+    // If a static path has been supplied, serve the compiled frontend from there.
+    // The catch-all route supports client-side routing in the React app.
+    if (typeof this.#options.staticPath === 'string' && this.#options.staticPath !== '') {
+      this.#app.use(express.static(this.#options.staticPath));
+
+      this.#app.get('*', (request, response) => {
+        response.sendFile(path.join(this.#options.staticPath, 'index.html'));
+      });
+    }
+
+    // Start listening on either a specific host or all interfaces. Host is optional
+    // so simple apps can just bind to the default network behaviour.
+    await new Promise((resolve) => {
+      if (typeof this.#options.host === 'string' && this.#options.host !== '') {
+        this.#server = this.#app.listen(this.#options.port, this.#options.host, resolve);
+      } else {
+        this.#server = this.#app.listen(this.#options.port, resolve);
+      }
+    });
+
+    this.#log(LOG_LEVELS.INFO, 'HomeKit UI listening on port %s', this.#options.port);
+    return true;
+  }
+
+  async stop() {
+    // No server means there is nothing to stop. Return false so the caller can tell
+    // whether this call actually changed anything.
+    if (this.#server === undefined) {
+      return false;
+    }
+
+    // Close the HTTP server gracefully. This only stops the web UI; it does not
+    // unpublish or remove the HomeKit accessory.
+    await new Promise((resolve) => {
+      this.#server.close(resolve);
+    });
+
+    // Drop references so the instance can be started again later if required.
+    this.#server = undefined;
+    this.#app = undefined;
+    return true;
+  }
+
+  async #handleInfo(request, response) {
+    // Return simple metadata used by the UI header/about screen.
+    response.json({
+      name: this.#options.name,
+      version: this.#options.version,
+      uiVersion: HomeKitUI.VERSION,
+    });
+  }
+
+  async #handleGetConfig(request, response) {
+    try {
+      // Load the current configuration from disk every time so the UI reflects
+      // external edits made while the service is running.
+      response.json(await this.#readJsonFile(this.#options.configFile));
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleSaveConfig(request, response) {
+    try {
+      // Config saves must be plain JSON objects. Arrays or primitive values would
+      // not match the expected config file layout for the standalone apps.
+      if (request.body === null || typeof request.body !== 'object' || request.body.constructor !== Object) {
+        throw new TypeError('Invalid configuration supplied');
+      }
+
+      // Let the host application perform project-specific validation. This is where
+      // GPIO validation, HomeKit pin validation, schema validation, or migration can run.
+      if (typeof this.#options.onValidateConfig === 'function') {
+        await this.#options.onValidateConfig(request.body);
+      }
+
+      // Prefer host-controlled saving when provided. This allows the app to preserve
+      // formatting, regenerate defaults, or update runtime state before writing.
+      if (typeof this.#options.onSaveConfig === 'function') {
+        await this.#options.onSaveConfig(request.body);
+      } else {
+        await this.#writeJsonFile(this.#options.configFile, request.body);
+      }
+
+      // Most config changes require the standalone process to restart so HAP and
+      // hardware resources are rebuilt cleanly.
+      response.json({ ok: true, restartRequired: true });
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleGetSchema(request, response) {
+    try {
+      // Serve the JSON Schema that drives the generated form. The frontend can use
+      // this with RJSF or another schema renderer to mimic Homebridge Config UI.
+      response.json(await this.#readJsonFile(this.#options.schemaFile));
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleHomeKit(request, response) {
+    try {
+      // Build a single HomeKit status object for the UI. This keeps QR generation,
+      // setup URI handling, and pairing state logic out of the frontend.
+      response.json(await this.#homeKitDetails());
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleResetPairing(request, response) {
+    try {
+      let accessory = this.#options.accessory;
+      let details = await this.#homeKitDetails();
+
+      // Prefer an explicit username from the request, but normally the current
+      // accessory username is used. Username is the HAP MAC-style identifier.
+      let username = typeof request.body?.username === 'string' && request.body.username !== '' ? request.body.username : details.username;
+
+      if (typeof username !== 'string' || username === '') {
+        throw new Error('Cannot reset HomeKit pairing because no accessory username is available');
+      }
+
+      // If the host application supplied a reset hook, delegate to it. This is useful
+      // if the app needs to clear extra state, remove multiple accessories, or exit.
+      if (typeof this.#options.onResetPairing === 'function') {
+        await this.#options.onResetPairing(username, accessory);
+      } else {
+        // Default reset flow for a single HAP-NodeJS accessory:
+        // 1. Stop advertising the current accessory.
+        // 2. Destroy the accessory if supported.
+        // 3. Remove HAP-NodeJS pairing/persist data for the username.
+        //
+        // This will remove ALL pairings. The accessory must be re-added in Home.
+        if (typeof accessory?.unpublish === 'function') {
+          accessory.unpublish();
+        }
+
+        if (typeof accessory?.destroy === 'function') {
+          accessory.destroy();
+        }
+
+        // Prefer the HAP API object supplied by the host app. Fall back to the
+        // accessory constructor to support different HAP-NodeJS import styles.
+        if (typeof this.#options.hap?.Accessory?.cleanupAccessoryData === 'function') {
+          this.#options.hap.Accessory.cleanupAccessoryData(username);
+        } else if (typeof accessory?.constructor?.cleanupAccessoryData === 'function') {
+          accessory.constructor.cleanupAccessoryData(username);
+        } else {
+          throw new Error('HAP-NodeJS cleanupAccessoryData() is not available');
+        }
+      }
+
+      // Restart is strongly recommended after reset so the accessory is recreated
+      // and starts advertising as a fresh pairing target.
+      response.json({ ok: true, restartRequired: true });
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleRestart(request, response) {
+    try {
+      // Restart is intentionally delegated to the host app. This module should not
+      // assume systemd, PM2, Docker, launchd, or direct process management.
+      if (typeof this.#options.onRestart !== 'function') {
+        response.status(501).json({ error: 'Restart hook not configured' });
+        return;
+      }
+
+      await this.#options.onRestart();
+      response.json({ ok: true });
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleLogs(request, response) {
+    try {
+      // Logs are app-specific, so the host app provides the actual retrieval logic.
+      // If no hook is configured, return an empty list rather than failing the UI.
+      if (typeof this.#options.onLogs !== 'function') {
+        response.json({ logs: [] });
+        return;
+      }
+
+      response.json({ logs: await this.#options.onLogs() });
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleBackup(request, response) {
+    try {
+      // Backup is just the current config file returned as a download. This keeps
+      // backup/restore simple and transparent for the user.
+      response.setHeader('Content-Type', 'application/json');
+      response.setHeader('Content-Disposition', 'attachment; filename="config.backup.json"');
+      response.send(JSON.stringify(await this.#readJsonFile(this.#options.configFile), null, 2) + '\n');
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleRestore(request, response) {
+    try {
+      // Restore uses the same plain-object requirement as normal config save.
+      if (request.body === null || typeof request.body !== 'object' || request.body.constructor !== Object) {
+        throw new TypeError('Invalid configuration supplied');
+      }
+
+      // Validate before writing so a broken backup cannot silently overwrite the
+      // working configuration unless the host validator allows it.
+      if (typeof this.#options.onValidateConfig === 'function') {
+        await this.#options.onValidateConfig(request.body);
+      }
+
+      // Allow the host app to handle restore differently from normal save. For
+      // example, it may want to keep the existing HomeKit username/pin.
+      if (typeof this.#options.onRestoreConfig === 'function') {
+        await this.#options.onRestoreConfig(request.body);
+      } else {
+        await this.#writeJsonFile(this.#options.configFile, request.body);
+      }
+
+      response.json({ ok: true, restartRequired: true });
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #homeKitDetails() {
+    let accessory = this.#options.accessory;
+
+    // HAP-NodeJS generates the HomeKit setup URI from the accessory pairing details.
+    // This is the same payload that the QR code encodes.
+    let setupURI = typeof accessory?.setupURI === 'function' ? accessory.setupURI() : undefined;
+
+    // Convert setup URI into a browser-displayable PNG data URL. If setupURI is not
+    // available, QR code is left undefined and the UI can fall back to setup code.
+    let qrCode = setupURI !== undefined ? await QRCode.toDataURL(setupURI) : undefined;
+
+    // HAP-NodeJS stores live pairing state internally. This is not as clean as a
+    // public API, but is the practical way to mirror the Homebridge UI behaviour.
+    let accessoryInfo = accessory?._accessoryInfo;
+    let pairings = [];
+
+    // Pairing list is optional depending on HAP-NodeJS version. If it fails, hide
+    // the list rather than failing the whole HomeKit page.
+    if (typeof accessoryInfo?.listPairings === 'function') {
+      try {
+        pairings = accessoryInfo.listPairings();
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        pairings = [];
+      }
+    }
+
+    // Return a frontend-friendly object. The UI can render the QR image directly
+    // from qrCode, show setupURI for debugging, and use paired to control warnings.
+    return {
+      displayName: accessory?.displayName,
+      username: accessory?.username ?? accessory?.lastKnownUsername ?? accessoryInfo?.username,
+      pincode: accessory?.pincode ?? accessoryInfo?.pincode,
+      setupID: accessory?._setupID ?? accessoryInfo?.setupID,
+      setupURI,
+      qrCode,
+      paired: typeof accessoryInfo?.paired === 'function' ? accessoryInfo.paired() === true : false,
+      pairings,
+    };
+  }
+
+  async #readJsonFile(file) {
+    // Require a valid file path before attempting disk access. This gives a useful
+    // API error if the host app forgot to configure configFile/schemaFile.
+    if (typeof file !== 'string' || file === '') {
+      throw new Error('JSON file path not configured');
+    }
+
+    // Parse and return JSON. Any syntax error is intentionally allowed to throw so
+    // the UI can surface a clear configuration/schema problem.
+    return JSON.parse(await fs.readFile(file, 'utf8'));
+  }
+
+  async #writeJsonFile(file, data) {
+    // Require a valid file path before writing so bad setup cannot write somewhere
+    // unexpected or fail with a cryptic fs error.
+    if (typeof file !== 'string' || file === '') {
+      throw new Error('JSON file path not configured');
+    }
+
+    // Write formatted JSON with a trailing newline to match the style used by the
+    // standalone config files.
+    await fs.writeFile(file, JSON.stringify(data, null, 2) + '\n');
+  }
+
+  #sendError(response, error) {
+    // Normalise all API errors through one path so logging and client responses are
+    // consistent across config, HomeKit, and maintenance endpoints.
+    this.#log(LOG_LEVELS.ERROR, String(error?.stack ?? error));
+    response.status(500).json({ error: String(error?.message ?? error) });
+  }
+
+  #log(level, message, ...args) {
+    // Ignore invalid log messages. This keeps endpoint error handling safe even if
+    // a caller passes unusual values.
+    if (typeof message !== 'string' || message === '') {
+      return;
+    }
+
+    // Use the requested log level when the host logger supports it.
+    if (typeof this.#options.log?.[level] === 'function') {
+      this.#options.log[level](message, ...args);
+      return;
+    }
+
+    // Fall back to info so basic console-style loggers still work.
+    if (typeof this.#options.log?.info === 'function') {
+      this.#options.log.info(message, ...args);
+    }
+  }
+}
