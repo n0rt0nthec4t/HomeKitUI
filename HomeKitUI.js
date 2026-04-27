@@ -8,8 +8,8 @@
 // and managing HomeKit accessories without requiring Homebridge.
 //
 // Responsibilities:
-// - Serve a local web-based configuration interface
-// - Expose config.json and config.schema.json for UI rendering
+// - Serve the built-in HomeKitUI web interface
+// - Expose config.json, config.schema.json, and config.ui.schema.json for UI rendering
 // - Handle configuration save, validation, backup, and restore workflows
 // - Provide HomeKit pairing details (QR code, setup URI, pairing state)
 // - Support resetting HomeKit pairing data via HAP-NodeJS cleanup
@@ -18,6 +18,8 @@
 // Architecture:
 // - Intended to be used alongside HomeKitDevice-based projects
 // - Operates at the application/bridge level (not per-device instance)
+// - HomeKitUI owns the application shell, status page, logs, and maintenance pages
+// - Host projects provide configuration schema and optional extra page metadata
 // - UI communicates with the host application via API endpoints and hooks
 //
 // API Endpoints:
@@ -25,6 +27,7 @@
 // - GET  /api/config
 // - POST /api/config
 // - GET  /api/schema
+// - GET  /api/ui-schema
 // - GET  /api/homekit
 // - POST /api/homekit/reset
 // - POST /api/service/restart
@@ -43,7 +46,11 @@
 //   log,
 //   configFile: './config.json',
 //   schemaFile: './config.schema.json',
-//   staticPath: './ui/build',
+//   uiSchemaFile: './config.ui.schema.json',
+//
+//   pages: [
+//     { id: 'zones', title: 'Zones', icon: 'sprinkler', schemaPath: 'zones' },
+//   ],
 //
 //   onRestart: async () => process.exit(0),
 // });
@@ -55,6 +62,7 @@
 // - Does not manage accessory lifecycle or publishing directly
 // - Host application remains responsible for device creation and runtime control
 // - Resetting HomeKit pairing removes all controllers and requires re-pairing
+// - Built-in UI is always served from this module's dist/ui folder
 //
 // Mark Hulskamp
 'use strict';
@@ -66,8 +74,12 @@ import QRCode from 'qrcode';
 // Define nodejs module requirements
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Define constants
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const STATIC_PATH = path.join(__dirname, 'dist', 'ui');
+
 const LOG_LEVELS = {
   INFO: 'info',
   WARN: 'warn',
@@ -102,7 +114,8 @@ export default class HomeKitUI {
       host: undefined,
       configFile: undefined,
       schemaFile: undefined,
-      staticPath: undefined,
+      uiSchemaFile: undefined,
+      pages: [],
       accessory: undefined,
       hap: undefined,
       log: console,
@@ -114,6 +127,12 @@ export default class HomeKitUI {
       onLogs: undefined,
       ...options,
     };
+
+    // Project pages are optional metadata used by the built-in UI to add extra
+    // sidebar entries or schema-backed config sections. Keep them as an array only.
+    if (Array.isArray(this.#options.pages) === false) {
+      this.#options.pages = [];
+    }
   }
 
   async start() {
@@ -123,19 +142,20 @@ export default class HomeKitUI {
       return false;
     }
 
-    // Create a new Express application for our API and static UI assets.
+    // Create a new Express application for our API and built-in static UI assets.
     this.#app = express();
 
     // Accept JSON payloads for config save/restore and maintenance actions.
     // Limit is intentionally small since configs should not be large.
     this.#app.use(express.json({ limit: '2mb' }));
 
-    // Register core API routes. Keep routes flat and explicit so the frontend can
+    // Register core API routes. Keep routes flat and explicit so the built-in UI can
     // remain simple and the host app has a predictable API contract.
     this.#app.get('/api/info', this.#handleInfo.bind(this));
     this.#app.get('/api/config', this.#handleGetConfig.bind(this));
     this.#app.post('/api/config', this.#handleSaveConfig.bind(this));
     this.#app.get('/api/schema', this.#handleGetSchema.bind(this));
+    this.#app.get('/api/ui-schema', this.#handleGetUISchema.bind(this));
     this.#app.get('/api/homekit', this.#handleHomeKit.bind(this));
     this.#app.post('/api/homekit/reset', this.#handleResetPairing.bind(this));
     this.#app.post('/api/service/restart', this.#handleRestart.bind(this));
@@ -143,15 +163,14 @@ export default class HomeKitUI {
     this.#app.get('/api/backup', this.#handleBackup.bind(this));
     this.#app.post('/api/restore', this.#handleRestore.bind(this));
 
-    // If a static path has been supplied, serve the compiled frontend from there.
-    // The catch-all route supports client-side routing in the React app.
-    if (typeof this.#options.staticPath === 'string' && this.#options.staticPath !== '') {
-      this.#app.use(express.static(this.#options.staticPath));
+    // The web app shell is owned by HomeKitUI and is not project-overridable.
+    // Host projects extend the UI by providing schema/ui-schema/page metadata.
+    this.#app.use(express.static(STATIC_PATH));
 
-      this.#app.get('*', (request, response) => {
-        response.sendFile(path.join(this.#options.staticPath, 'index.html'));
-      });
-    }
+    // Client-side routing support. Any non-API route returns the built-in UI entry.
+    this.#app.get('*', (request, response) => {
+      response.sendFile(path.join(STATIC_PATH, 'index.html'));
+    });
 
     // Start listening on either a specific host or all interfaces. Host is optional
     // so simple apps can just bind to the default network behaviour.
@@ -187,11 +206,13 @@ export default class HomeKitUI {
   }
 
   async #handleInfo(request, response) {
-    // Return simple metadata used by the UI header/about screen.
+    // Return metadata used by the built-in UI header/sidebar. Project-provided pages
+    // are included here so the UI shell can add extra navigation items dynamically.
     response.json({
       name: this.#options.name,
       version: this.#options.version,
       uiVersion: HomeKitUI.VERSION,
+      pages: this.#sanitisePages(this.#options.pages),
     });
   }
 
@@ -237,9 +258,24 @@ export default class HomeKitUI {
 
   async #handleGetSchema(request, response) {
     try {
-      // Serve the JSON Schema that drives the generated form. The frontend can use
-      // this with RJSF or another schema renderer to mimic Homebridge Config UI.
+      // Serve the JSON Schema that drives the generated form. The built-in UI can
+      // use this with RJSF or another schema renderer to mimic Homebridge Config UI.
       response.json(await this.#readJsonFile(this.#options.schemaFile));
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleGetUISchema(request, response) {
+    try {
+      // UI schema is optional. If not supplied, return an empty object so the
+      // frontend can still render the configuration form from the JSON Schema.
+      if (typeof this.#options.uiSchemaFile !== 'string' || this.#options.uiSchemaFile === '') {
+        response.json({});
+        return;
+      }
+
+      response.json(await this.#readJsonFile(this.#options.uiSchemaFile));
     } catch (error) {
       this.#sendError(response, error);
     }
@@ -439,6 +475,24 @@ export default class HomeKitUI {
     // Write formatted JSON with a trailing newline to match the style used by the
     // standalone config files.
     await fs.writeFile(file, JSON.stringify(data, null, 2) + '\n');
+  }
+
+  #sanitisePages(pages = []) {
+    // Project pages are treated as metadata only. Sanitise them before exposing to
+    // the frontend so a bad project config cannot inject arbitrary values.
+    if (Array.isArray(pages) === false) {
+      return [];
+    }
+
+    return pages
+      .filter((page) => page !== null && typeof page === 'object' && page.constructor === Object)
+      .map((page) => ({
+        id: typeof page.id === 'string' && page.id !== '' ? page.id : undefined,
+        title: typeof page.title === 'string' && page.title !== '' ? page.title : undefined,
+        icon: typeof page.icon === 'string' && page.icon !== '' ? page.icon : undefined,
+        schemaPath: typeof page.schemaPath === 'string' && page.schemaPath !== '' ? page.schemaPath : undefined,
+      }))
+      .filter((page) => page.id !== undefined && page.title !== undefined);
   }
 
   #sendError(response, error) {
