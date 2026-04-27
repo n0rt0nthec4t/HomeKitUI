@@ -10,16 +10,18 @@
 // Responsibilities:
 // - Serve the built-in HomeKitUI web interface
 // - Expose config.json, config.schema.json, and config.ui.schema.json for UI rendering
+// - Provide generic project page data through a single page API endpoint
 // - Handle configuration save, validation, backup, and restore workflows
 // - Provide HomeKit pairing details (QR code, setup URI, pairing state)
+// - Stream Logger history/live entries to the built-in UI
 // - Support resetting HomeKit pairing data via HAP-NodeJS cleanup
-// - Provide optional hooks for restart, logging, and maintenance actions
+// - Provide optional hooks for restart and maintenance actions
 //
 // Architecture:
 // - Intended to be used alongside HomeKitDevice-based projects
 // - Operates at the application/bridge level (not per-device instance)
 // - HomeKitUI owns the application shell, status page, logs, and maintenance pages
-// - Host projects provide configuration schema and optional extra page metadata
+// - Host projects provide configuration schema, optional pages, and page data hooks
 // - UI communicates with the host application via API endpoints and hooks
 //
 // API Endpoints:
@@ -28,41 +30,21 @@
 // - POST /api/config
 // - GET  /api/schema
 // - GET  /api/ui-schema
+// - GET  /api/page/:id
 // - GET  /api/homekit
 // - POST /api/homekit/reset
 // - POST /api/service/restart
 // - GET  /api/logs
+// - GET  /api/logs/stream
 // - GET  /api/backup
 // - POST /api/restore
-//
-// Example:
-//
-// import HomeKitUI from './HomeKitUI.js';
-//
-// let ui = new HomeKitUI({
-//   name: 'My HomeKit App',
-//   accessory,
-//   hap,
-//   log,
-//   configFile: './config.json',
-//   schemaFile: './config.schema.json',
-//   uiSchemaFile: './config.ui.schema.json',
-//
-//   pages: [
-//     { id: 'zones', title: 'Zones', icon: 'sprinkler', schemaPath: 'zones' },
-//   ],
-//
-//   onRestart: async () => process.exit(0),
-// });
-//
-// await ui.start();
 //
 // Notes:
 // - Designed for HAP-NodeJS standalone environments (not Homebridge)
 // - Does not manage accessory lifecycle or publishing directly
 // - Host application remains responsible for device creation and runtime control
 // - Resetting HomeKit pairing removes all controllers and requires re-pairing
-// - Built-in UI is always served from this module's dist/ui folder
+// - Built-in UI is always served from this module's ui folder
 //
 // Mark Hulskamp
 'use strict';
@@ -74,11 +56,12 @@ import QRCode from 'qrcode';
 // Define nodejs module requirements
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 // Define constants
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STATIC_PATH = path.join(__dirname, 'dist', 'ui');
+const STATIC_PATH = path.join(__dirname, 'ui');
 
 const LOG_LEVELS = {
   INFO: 'info',
@@ -94,8 +77,9 @@ export default class HomeKitUI {
 
   // Internal data only for this class
   #app = undefined; // Express app instance
-  #server = undefined; // HTTP server instance
+  #logListeners = new Map(); // Active SSE response -> logger listener map
   #options = {}; // Runtime options
+  #server = undefined; // HTTP server instance
 
   constructor(options = {}) {
     // Options must be a plain object. If not, fall back to defaults so the class
@@ -106,7 +90,7 @@ export default class HomeKitUI {
 
     // Store all runtime options in one internal object so the public class surface
     // remains small. Hooks allow each standalone app to provide its own validation,
-    // saving, logging, restart, and pairing reset behaviour.
+    // saving, restart, pairing reset, and generic page data behaviour.
     this.#options = {
       name: 'HomeKit Device',
       version: HomeKitUI.VERSION,
@@ -115,16 +99,18 @@ export default class HomeKitUI {
       configFile: undefined,
       schemaFile: undefined,
       uiSchemaFile: undefined,
+      theme: {},
       pages: [],
       accessory: undefined,
       hap: undefined,
-      log: console,
+      log: undefined,
+      logger: undefined,
+      onGetPage: undefined,
       onValidateConfig: undefined,
       onSaveConfig: undefined,
       onRestoreConfig: undefined,
       onRestart: undefined,
       onResetPairing: undefined,
-      onLogs: undefined,
       ...options,
     };
 
@@ -135,7 +121,16 @@ export default class HomeKitUI {
     }
   }
 
-  async start() {
+  async start(options = {}) {
+    // Runtime options may be supplied at start time because some values, like the
+    // HAP accessory, may not exist until after the application has initialised.
+    if (options !== null && typeof options === 'object' && options.constructor === Object) {
+      this.#options = {
+        ...this.#options,
+        ...options,
+      };
+    }
+
     // If the HTTP server is already running, don't bind twice. This makes start()
     // safe to call from app initialisation code that may be retried.
     if (this.#server !== undefined) {
@@ -156,10 +151,12 @@ export default class HomeKitUI {
     this.#app.post('/api/config', this.#handleSaveConfig.bind(this));
     this.#app.get('/api/schema', this.#handleGetSchema.bind(this));
     this.#app.get('/api/ui-schema', this.#handleGetUISchema.bind(this));
+    this.#app.get('/api/page/:id', this.#handlePage.bind(this));
     this.#app.get('/api/homekit', this.#handleHomeKit.bind(this));
     this.#app.post('/api/homekit/reset', this.#handleResetPairing.bind(this));
     this.#app.post('/api/service/restart', this.#handleRestart.bind(this));
     this.#app.get('/api/logs', this.#handleLogs.bind(this));
+    this.#app.get('/api/logs/stream', this.#handleLogStream.bind(this));
     this.#app.get('/api/backup', this.#handleBackup.bind(this));
     this.#app.post('/api/restore', this.#handleRestore.bind(this));
 
@@ -168,7 +165,7 @@ export default class HomeKitUI {
     this.#app.use(express.static(STATIC_PATH));
 
     // Client-side routing support. Any non-API route returns the built-in UI entry.
-    this.#app.get('*', (request, response) => {
+    this.#app.use((request, response) => {
       response.sendFile(path.join(STATIC_PATH, 'index.html'));
     });
 
@@ -182,7 +179,7 @@ export default class HomeKitUI {
       }
     });
 
-    this.#log(LOG_LEVELS.INFO, 'HomeKit UI listening on port %s', this.#options.port);
+    this.#log(LOG_LEVELS.INFO, 'HomeKitUI listening on port %s', this.#options.port);
     return true;
   }
 
@@ -192,6 +189,23 @@ export default class HomeKitUI {
     if (this.#server === undefined) {
       return false;
     }
+
+    // Remove live logger listeners and close any active log streams before shutting
+    // down the HTTP server.
+    for (let [response, listener] of this.#logListeners) {
+      if (typeof this.#options.logger?.removeListener === 'function') {
+        this.#options.logger.removeListener(listener);
+      }
+
+      try {
+        response.end();
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
+    }
+
+    this.#logListeners.clear();
 
     // Close the HTTP server gracefully. This only stops the web UI; it does not
     // unpublish or remove the HomeKit accessory.
@@ -212,7 +226,10 @@ export default class HomeKitUI {
       name: this.#options.name,
       version: this.#options.version,
       uiVersion: HomeKitUI.VERSION,
+      port: this.#options.port,
+      uptime: process.uptime(),
       pages: this.#sanitisePages(this.#options.pages),
+      theme: this.#options.theme ?? {},
     });
   }
 
@@ -281,6 +298,33 @@ export default class HomeKitUI {
     }
   }
 
+  async #handlePage(request, response) {
+    try {
+      // Project pages are intentionally generic. HomeKitUI does not know about
+      // tanks, zones, cameras, locks, or any other project-specific concepts.
+      // The host project returns renderer-friendly data for the requested page id.
+      let id = typeof request.params?.id === 'string' ? request.params.id : undefined;
+
+      if (typeof id !== 'string' || id === '') {
+        throw new Error('Invalid page id');
+      }
+
+      if (this.#hasPage(id) === false) {
+        response.status(404).json({ error: 'Unknown page' });
+        return;
+      }
+
+      if (typeof this.#options.onGetPage === 'function') {
+        response.json(await this.#options.onGetPage(id));
+        return;
+      }
+
+      response.json({});
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
   async #handleHomeKit(request, response) {
     try {
       // Build a single HomeKit status object for the UI. This keeps QR generation,
@@ -304,27 +348,19 @@ export default class HomeKitUI {
         throw new Error('Cannot reset HomeKit pairing because no accessory username is available');
       }
 
-      // If the host application supplied a reset hook, delegate to it. This is useful
-      // if the app needs to clear extra state, remove multiple accessories, or exit.
+      // If the host application supplied a reset hook, delegate to it.
       if (typeof this.#options.onResetPairing === 'function') {
         await this.#options.onResetPairing(username, accessory);
       } else {
         // Default reset flow for a single HAP-NodeJS accessory:
-        // 1. Stop advertising the current accessory.
-        // 2. Destroy the accessory if supported.
-        // 3. Remove HAP-NodeJS pairing/persist data for the username.
+        //
+        // 1. Remove HAP-NodeJS pairing/persist data for the username.
+        // 2. Let the host application restart the process.
+        //
+        // Do NOT call accessory.unpublish() or accessory.destroy() here.
+        // HAP-NodeJS/bonjour teardown can race during active advertisement.
         //
         // This will remove ALL pairings. The accessory must be re-added in Home.
-        if (typeof accessory?.unpublish === 'function') {
-          accessory.unpublish();
-        }
-
-        if (typeof accessory?.destroy === 'function') {
-          accessory.destroy();
-        }
-
-        // Prefer the HAP API object supplied by the host app. Fall back to the
-        // accessory constructor to support different HAP-NodeJS import styles.
         if (typeof this.#options.hap?.Accessory?.cleanupAccessoryData === 'function') {
           this.#options.hap.Accessory.cleanupAccessoryData(username);
         } else if (typeof accessory?.constructor?.cleanupAccessoryData === 'function') {
@@ -332,10 +368,14 @@ export default class HomeKitUI {
         } else {
           throw new Error('HAP-NodeJS cleanupAccessoryData() is not available');
         }
+
+        if (typeof this.#options.onRestart === 'function') {
+          response.json({ ok: true, restartRequired: true });
+          await this.#options.onRestart();
+          return;
+        }
       }
 
-      // Restart is strongly recommended after reset so the accessory is recreated
-      // and starts advertising as a fresh pairing target.
       response.json({ ok: true, restartRequired: true });
     } catch (error) {
       this.#sendError(response, error);
@@ -360,17 +400,59 @@ export default class HomeKitUI {
 
   async #handleLogs(request, response) {
     try {
-      // Logs are app-specific, so the host app provides the actual retrieval logic.
-      // If no hook is configured, return an empty list rather than failing the UI.
-      if (typeof this.#options.onLogs !== 'function') {
-        response.json({ logs: [] });
+      // Prefer the shared Logger interface. This avoids scraping stdout/stderr and
+      // allows logs from before HomeKitUI.start() to be displayed.
+      if (typeof this.#options.logger?.history === 'function') {
+        response.json({ logs: this.#options.logger.history() });
         return;
       }
 
-      response.json({ logs: await this.#options.onLogs() });
+      response.json({ logs: [] });
     } catch (error) {
       this.#sendError(response, error);
     }
+  }
+
+  async #handleLogStream(request, response) {
+    // Keep an HTTP connection open so log entries can be pushed to the browser.
+    response.setHeader('Content-Type', 'text/event-stream');
+    response.setHeader('Cache-Control', 'no-cache');
+    response.setHeader('Connection', 'keep-alive');
+
+    // Initial event confirms the stream is open. Browser EventSource will reconnect
+    // automatically if this connection drops.
+    response.write('event: connected\n');
+    response.write('data: true\n\n');
+
+    // Subscribe to Logger live entries when the host supplied a compatible logger.
+    if (typeof this.#options.logger?.addListener === 'function' && typeof this.#options.logger?.removeListener === 'function') {
+      let listener = (entry) => {
+        try {
+          response.write('data: ' + JSON.stringify(entry) + '\n\n');
+          // eslint-disable-next-line no-unused-vars
+        } catch (error) {
+          if (typeof this.#options.logger?.removeListener === 'function') {
+            this.#options.logger.removeListener(listener);
+          }
+
+          this.#logListeners.delete(response);
+        }
+      };
+
+      this.#logListeners.set(response, listener);
+      this.#options.logger.addListener(listener);
+    }
+
+    // Remove closed clients so we don't leak response handles or logger listeners.
+    request.on('close', () => {
+      let listener = this.#logListeners.get(response);
+
+      if (listener !== undefined && typeof this.#options.logger?.removeListener === 'function') {
+        this.#options.logger.removeListener(listener);
+      }
+
+      this.#logListeners.delete(response);
+    });
   }
 
   async #handleBackup(request, response) {
@@ -477,6 +559,12 @@ export default class HomeKitUI {
     await fs.writeFile(file, JSON.stringify(data, null, 2) + '\n');
   }
 
+  #hasPage(id) {
+    // Only allow requests for pages explicitly advertised by the host project.
+    // This prevents arbitrary ids from reaching the project's page data hook.
+    return this.#sanitisePages(this.#options.pages).some((page) => page.id === id);
+  }
+
   #sanitisePages(pages = []) {
     // Project pages are treated as metadata only. Sanitise them before exposing to
     // the frontend so a bad project config cannot inject arbitrary values.
@@ -490,6 +578,7 @@ export default class HomeKitUI {
         id: typeof page.id === 'string' && page.id !== '' ? page.id : undefined,
         title: typeof page.title === 'string' && page.title !== '' ? page.title : undefined,
         icon: typeof page.icon === 'string' && page.icon !== '' ? page.icon : undefined,
+        svg: typeof page.svg === 'string' && page.svg !== '' ? page.svg : undefined,
         schemaPath: typeof page.schemaPath === 'string' && page.schemaPath !== '' ? page.schemaPath : undefined,
       }))
       .filter((page) => page.id !== undefined && page.title !== undefined);
@@ -512,12 +601,6 @@ export default class HomeKitUI {
     // Use the requested log level when the host logger supports it.
     if (typeof this.#options.log?.[level] === 'function') {
       this.#options.log[level](message, ...args);
-      return;
-    }
-
-    // Fall back to info so basic console-style loggers still work.
-    if (typeof this.#options.log?.info === 'function') {
-      this.#options.log.info(message, ...args);
     }
   }
 }
