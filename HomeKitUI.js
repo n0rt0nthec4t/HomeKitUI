@@ -102,6 +102,7 @@ export default class HomeKitUI {
       theme: {},
       pages: [],
       accessory: undefined,
+      accessories: [],
       hap: undefined,
       log: undefined,
       logger: undefined,
@@ -119,6 +120,13 @@ export default class HomeKitUI {
     if (Array.isArray(this.#options.pages) === false) {
       this.#options.pages = [];
     }
+
+    // Multiple accessories are optional. Keep backwards compatibility with the
+    // original single accessory option while allowing standalone apps to expose
+    // more than one independently paired HAP accessory.
+    if (Array.isArray(this.#options.accessories) === false) {
+      this.#options.accessories = [];
+    }
   }
 
   async start(options = {}) {
@@ -131,11 +139,29 @@ export default class HomeKitUI {
       };
     }
 
+    if (Array.isArray(this.#options.pages) === false) {
+      this.#options.pages = [];
+    }
+
+    if (Array.isArray(this.#options.accessories) === false) {
+      this.#options.accessories = [];
+    }
+
     // If the HTTP server is already running, don't bind twice. This makes start()
     // safe to call from app initialisation code that may be retried.
     if (this.#server !== undefined) {
       return false;
     }
+
+    // Avoid Node/Express treating port 0 as "pick a random port". For HomeKitUI,
+    // disabled should be handled by the host project, but this guard keeps the
+    // module safe if an invalid port is accidentally passed in.
+    if (Number.isFinite(Number(this.#options.port)) !== true || Number(this.#options.port) <= 0 || Number(this.#options.port) > 65535) {
+      this.#log(LOG_LEVELS.INFO, 'HomeKitUI disabled');
+      return false;
+    }
+
+    this.#options.port = Number(this.#options.port);
 
     // Create a new Express application for our API and built-in static UI assets.
     this.#app = express();
@@ -300,6 +326,13 @@ export default class HomeKitUI {
 
   async #handlePage(request, response) {
     try {
+      // Disable browser caching for dynamic page data.
+      // Without this, Safari will return 304 (Not Modified) and you won’t see updates.
+      // This endpoint is dynamic (runtime state), so it must always be fresh.
+      response.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      response.setHeader('Pragma', 'no-cache');
+      response.setHeader('Expires', '0');
+
       // Project pages are intentionally generic. HomeKitUI does not know about
       // tanks, zones, cameras, locks, or any other project-specific concepts.
       // The host project returns renderer-friendly data for the requested page id.
@@ -309,16 +342,28 @@ export default class HomeKitUI {
         throw new Error('Invalid page id');
       }
 
+      // Ensure requested page actually exists in configured pages list
       if (this.#hasPage(id) === false) {
         response.status(404).json({ error: 'Unknown page' });
         return;
       }
 
+      // Delegate page data generation to host application
+      // This keeps HomeKitUI completely generic and reusable
       if (typeof this.#options.onGetPage === 'function') {
-        response.json(await this.#options.onGetPage(id));
+        let data = await this.#options.onGetPage(id);
+
+        // Always return a plain object to keep frontend logic simple
+        if (data === null || typeof data !== 'object') {
+          response.json({});
+          return;
+        }
+
+        response.json(data);
         return;
       }
 
+      // No handler provided, return empty payload
       response.json({});
     } catch (error) {
       this.#sendError(response, error);
@@ -327,7 +372,7 @@ export default class HomeKitUI {
 
   async #handleHomeKit(request, response) {
     try {
-      // Build a single HomeKit status object for the UI. This keeps QR generation,
+      // Build HomeKit status objects for the UI. This keeps QR generation,
       // setup URI handling, and pairing state logic out of the frontend.
       response.json(await this.#homeKitDetails());
     } catch (error) {
@@ -337,12 +382,12 @@ export default class HomeKitUI {
 
   async #handleResetPairing(request, response) {
     try {
-      let accessory = this.#options.accessory;
       let details = await this.#homeKitDetails();
 
-      // Prefer an explicit username from the request, but normally the current
-      // accessory username is used. Username is the HAP MAC-style identifier.
+      // Prefer an explicit username from the request, but normally the first
+      // available accessory username is used. Username is the HAP MAC-style identifier.
       let username = typeof request.body?.username === 'string' && request.body.username !== '' ? request.body.username : details.username;
+      let accessory = this.#findAccessoryByUsername(username);
 
       if (typeof username !== 'string' || username === '') {
         throw new Error('Cannot reset HomeKit pairing because no accessory username is available');
@@ -352,15 +397,15 @@ export default class HomeKitUI {
       if (typeof this.#options.onResetPairing === 'function') {
         await this.#options.onResetPairing(username, accessory);
       } else {
-        // Default reset flow for a single HAP-NodeJS accessory:
+        // Default reset flow for HAP-NodeJS accessories:
         //
-        // 1. Remove HAP-NodeJS pairing/persist data for the username.
+        // 1. Remove HAP-NodeJS pairing/persist data for the selected username.
         // 2. Let the host application restart the process.
         //
         // Do NOT call accessory.unpublish() or accessory.destroy() here.
         // HAP-NodeJS/bonjour teardown can race during active advertisement.
         //
-        // This will remove ALL pairings. The accessory must be re-added in Home.
+        // This will remove pairings for the selected accessory. It must be re-added in Home.
         if (typeof this.#options.hap?.Accessory?.cleanupAccessoryData === 'function') {
           this.#options.hap.Accessory.cleanupAccessoryData(username);
         } else if (typeof accessory?.constructor?.cleanupAccessoryData === 'function') {
@@ -495,8 +540,31 @@ export default class HomeKitUI {
   }
 
   async #homeKitDetails() {
-    let accessory = this.#options.accessory;
+    let accessories = this.#accessories();
 
+    let items = [];
+
+    for (let accessory of accessories) {
+      items.push(await this.#accessoryHomeKitDetails(accessory));
+    }
+
+    // Return the new multi-accessory payload while preserving the original top-level
+    // fields for older frontends or simple single-accessory projects.
+    return {
+      accessories: items,
+      accessory: items[0],
+      displayName: items[0]?.displayName,
+      username: items[0]?.username,
+      pincode: items[0]?.pincode,
+      setupID: items[0]?.setupID,
+      setupURI: items[0]?.setupURI,
+      qrCode: items[0]?.qrCode,
+      paired: items[0]?.paired === true,
+      pairings: items[0]?.pairings ?? [],
+    };
+  }
+
+  async #accessoryHomeKitDetails(accessory) {
     // HAP-NodeJS generates the HomeKit setup URI from the accessory pairing details.
     // This is the same payload that the QR code encodes.
     let setupURI = typeof accessory?.setupURI === 'function' ? accessory.setupURI() : undefined;
@@ -533,6 +601,32 @@ export default class HomeKitUI {
       paired: typeof accessoryInfo?.paired === 'function' ? accessoryInfo.paired() === true : false,
       pairings,
     };
+  }
+
+  #findAccessoryByUsername(username) {
+    if (typeof username !== 'string' || username === '') {
+      return undefined;
+    }
+
+    return this.#accessories().find((accessory) => {
+      let accessoryInfo = accessory?._accessoryInfo;
+
+      return accessory?.username === username || accessory?.lastKnownUsername === username || accessoryInfo?.username === username;
+    });
+  }
+
+  #accessories() {
+    let accessories = [];
+
+    if (Array.isArray(this.#options.accessories) === true) {
+      accessories = this.#options.accessories.filter((accessory) => accessory !== undefined && accessory !== null);
+    }
+
+    if (accessories.length === 0 && this.#options.accessory !== undefined && this.#options.accessory !== null) {
+      accessories = [this.#options.accessory];
+    }
+
+    return accessories;
   }
 
   async #readJsonFile(file) {

@@ -54,7 +54,7 @@ async function load() {
   startLogStream();
 }
 
-// Main render function - builds entire UI
+// Main render function - builds entire UI shell
 function render() {
   let pages = [...corePages, ...(Array.isArray(state.info.pages) === true ? state.info.pages : [])];
 
@@ -83,15 +83,245 @@ function render() {
   `;
 
   renderLogsOnly(false);
+  renderSchemaMount();
 }
 
-// Status page combines pairing + logs
+// Render schema-backed form content into the current page after the main
+// HTML has been written. The form renderer uses DOM nodes, so it cannot be
+// returned directly from the template string used by renderConfigPage().
+function renderSchemaMount() {
+  let mount = document.getElementById('schemaForm');
+
+  // No schema form placeholder exists on non-config pages.
+  if (mount === null) {
+    return;
+  }
+
+  // Find the active project page so we know which part of the config/schema
+  // should be rendered into this form.
+  let page = (state.info.pages || []).find((item) => item.id === state.page);
+
+  // Pages without schemaPath are display-only pages and do not have a form.
+  if (page?.schemaPath === undefined) {
+    return;
+  }
+
+  // Pull both the current config value and its matching schema section from
+  // the configured schema path, then render the generic schema form.
+  let value = getSchemaPathValue(page.schemaPath);
+  let schema = getSchemaAtPath(page.schemaPath);
+
+  renderSchemaPage(mount, schema, value, page.schemaPath.split('.'));
+}
+
+// Generic schema-backed page renderer.
+// Dispatches to the correct renderer based on the schema type.
+function renderSchemaPage(container, schema, value, path = []) {
+  if (schema?.type === 'array') {
+    return renderSchemaArray(container, schema, value, path);
+  }
+
+  if (schema?.type === 'object') {
+    return renderSchemaObject(container, schema, value, path);
+  }
+
+  return renderSchemaField(container, schema, value, path);
+}
+
+// Render an array field from schema.items.
+// Each item is rendered as a generic config card and can be added or removed.
+function renderSchemaArray(container, schema, value = [], path) {
+  if (Array.isArray(value) === false) {
+    value = [];
+  }
+
+  let wrapper = document.createElement('div');
+  wrapper.className = 'config-list';
+
+  let addBtn = document.createElement('button');
+  addBtn.className = 'primary';
+  addBtn.textContent = '+ Add';
+  addBtn.onclick = () => {
+    value.push(getDefaultValue(schema.items));
+    setValueAtPath(state.config, path, value);
+    render();
+  };
+
+  wrapper.appendChild(addBtn);
+
+  value.forEach((item, index) => {
+    let row = document.createElement('div');
+    row.className = 'card config-card';
+
+    let header = document.createElement('div');
+    header.className = 'config-card-header';
+
+    let title = document.createElement('div');
+    title.className = 'config-card-title';
+
+    let displayName = typeof item?.name === 'string' && item.name.trim() !== '' ? item.name : `Item ${index + 1}`;
+
+    title.textContent = displayName;
+
+    let removeBtn = document.createElement('button');
+    removeBtn.className = 'secondary';
+    removeBtn.textContent = 'Remove';
+    removeBtn.onclick = () => {
+      value.splice(index, 1);
+      setValueAtPath(state.config, path, value);
+      render();
+    };
+
+    header.appendChild(title);
+    header.appendChild(removeBtn);
+    row.appendChild(header);
+
+    renderSchemaObject(row, schema.items, item, [...path, index]);
+
+    wrapper.appendChild(row);
+  });
+
+  container.appendChild(wrapper);
+}
+
+// Render an object field from schema.properties.
+// Fields are rendered in schema order as generic form rows.
+function renderSchemaObject(container, schema, value = {}, path) {
+  let props = schema?.properties || {};
+
+  Object.keys(props).forEach((key) => {
+    let fieldSchema = props[key];
+    let fieldValue = value[key];
+
+    let fieldWrapper = document.createElement('div');
+    fieldWrapper.className = 'config-row';
+
+    renderSchemaField(fieldWrapper, fieldSchema, fieldValue, [...path, key]);
+
+    container.appendChild(fieldWrapper);
+  });
+}
+
+// Render a primitive schema field.
+// Supports enum/select, boolean/checkbox, number/integer, and string inputs.
+function renderSchemaField(container, schema = {}, value, path) {
+  let label = document.createElement('div');
+  label.className = 'list-title';
+  label.textContent = schema.title || path[path.length - 1];
+
+  let input;
+
+  // ENUM (select)
+  if (Array.isArray(schema.enum) === true) {
+    input = document.createElement('select');
+
+    schema.enum.forEach((option) => {
+      let opt = document.createElement('option');
+      opt.value = option;
+      opt.textContent = option;
+
+      if (option === value) {
+        opt.selected = true;
+      }
+
+      input.appendChild(opt);
+    });
+  }
+
+  // BOOLEAN
+  else if (schema.type === 'boolean') {
+    input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = value === true;
+  }
+
+  // NUMBER / INTEGER
+  else if (schema.type === 'number' || schema.type === 'integer') {
+    input = document.createElement('input');
+    input.type = 'number';
+    input.value = value ?? '';
+    input.placeholder = 'disabled';
+
+    if (Number.isFinite(Number(schema.minimum)) === true) {
+      input.min = String(schema.minimum);
+    }
+
+    if (Number.isFinite(Number(schema.maximum)) === true) {
+      input.max = String(schema.maximum);
+    }
+
+    if (schema.type === 'integer') {
+      input.step = '1';
+    }
+  }
+
+  // STRING (default)
+  else {
+    input = document.createElement('input');
+    input.type = 'text';
+    input.value = value ?? '';
+
+    // live update for "name" fields
+    input.oninput = () => {
+      setValueAtPath(state.config, path, input.value);
+
+      if (path[path.length - 1] === 'name') {
+        let card = container.closest('.config-card');
+        let title = card?.querySelector('.config-card-title');
+
+        if (title !== null) {
+          title.textContent = input.value.trim() !== '' ? input.value : 'Item';
+        }
+      }
+    };
+  }
+
+  // CHANGE HANDLER (final value commit)
+  input.onchange = () => {
+    let newValue;
+
+    if (schema.type === 'boolean') {
+      newValue = input.checked;
+    } else if (schema.type === 'number' || schema.type === 'integer') {
+      newValue = input.value === '' ? undefined : Number(input.value);
+    } else {
+      newValue = input.value;
+    }
+
+    setValueAtPath(state.config, path, newValue);
+  };
+
+  container.appendChild(label);
+  container.appendChild(input);
+}
+
+// Status page combines HomeKit pairing cards, app actions, and logs
 function statusPage() {
   return `
-    <h1>HomeKit Status</h1>
+    <div class="page-header">
+      <div>
+        <h1>HomeKit Status</h1>
+        <div class="page-meta">
+          App v${escapeHTML(state.info.version || '')} •
+          UI v${escapeHTML(state.info.uiVersion || '')} •
+          Port ${escapeHTML(state.info.port || '')} •
+          Uptime <span class="uptime">${escapeHTML(formatUptime(uptimeSeconds))}</span>
+        </div>
+      </div>
+
+      <div class="page-actions">
+        <button title="Restart Service" onclick="restartService()">
+          ${restartIcon()}
+        </button>
+
+        <a title="Backup Configuration" href="/api/backup">
+          ${downloadIcon()}
+        </a>
+      </div>
+    </div>
 
     <div class="status-layout">
-      ${pairingCard()}
+      ${(state.homekit.accessories || [state.homekit]).map((accessory) => pairingCard(accessory)).join('')}
     </div>
 
     ${logsCard()}
@@ -99,55 +329,36 @@ function statusPage() {
 }
 
 // HomeKit pairing information card
-function pairingCard() {
+function pairingCard(accessory = state.homekit) {
   return `
     <section class="pairing-card">
-      <div class="pairing-title">${escapeHTML(state.info.name || 'HomeKit Device')}</div>
+      <div class="pairing-title">${escapeHTML(accessory.displayName || state.info.name || 'HomeKit Device')}</div>
 
       <div class="pairing-content">
         <div class="pairing-left">
           ${
-            state.homekit.qrCode
-              ? `<img class="qr" src="${state.homekit.qrCode}" alt="HomeKit QR Code">`
+            accessory.qrCode
+              ? `<img class="qr" src="${accessory.qrCode}" alt="HomeKit QR Code">`
               : '<div class="qr-missing">QR unavailable</div>'
           }
 
-          <div class="pin">${escapeHTML(state.homekit.pincode || '--- -- ---')}</div>
+          <div class="pin">${escapeHTML(accessory.pincode || '--- -- ---')}</div>
 
           <div class="pairing-status">
             <span class="hap-icon">${homeIcon()}</span>
             <span>HAP</span>
             <span>•</span>
             <button
-              class="pairing-state ${state.homekit.paired === true ? 'paired' : 'unpaired'}"
-              title="${state.homekit.paired === true ? 'Reset HomeKit Pairing' : 'Not Paired'}"
-              onclick="${state.homekit.paired === true ? 'resetPairing()' : ''}"
+              class="pairing-state ${accessory.paired === true ? 'paired' : 'unpaired'}"
+              title="${accessory.paired === true ? 'Reset HomeKit Pairing' : 'Not Paired'}"
+              onclick="${accessory.paired === true ? `resetPairing('${escapeHTML(accessory.username || '')}')` : ''}"
               data-dynamic="pairing"
             >
               ${linkIcon()}
             </button>
           </div>
 
-          <div class="meta">${escapeHTML(state.homekit.username || '')}</div>
-        </div>
-
-        <div class="pairing-right">
-          <div class="pairing-actions vertical">
-            <button title="Restart" onclick="restartService()">
-              ${restartIcon()}
-            </button>
-
-            <a title="Backup" href="/api/backup">
-              ${downloadIcon()}
-            </a>
-          </div>
-
-          <div class="details">
-            <div>App v${escapeHTML(state.info.version || '')}</div>
-            <div>UI v${escapeHTML(state.info.uiVersion || '')}</div>
-            <div>Port ${escapeHTML(state.info.port || '')}</div>
-            <div>Uptime <span id="uptime">${escapeHTML(formatUptime(uptimeSeconds))}</span></div>
-          </div>
+          <div class="meta">${escapeHTML(accessory.username || '')}</div>
         </div>
       </div>
     </section>
@@ -173,7 +384,8 @@ function logsCard() {
   `;
 }
 
-// Project-specific page renderer
+// Project-specific page renderer.
+// HomeKitUI remains generic by rendering list data or schema-backed config sections.
 function projectPage() {
   let page = (state.info.pages || []).find((item) => item.id === state.page);
 
@@ -190,7 +402,7 @@ function projectPage() {
   return renderConfigPage(page);
 }
 
-// Generic list page renderer
+// Generic list page renderer for host-provided list data
 function renderListPage(page, data) {
   return `
     <h1>${escapeHTML(page.title)}</h1>
@@ -218,28 +430,27 @@ function renderListPage(page, data) {
   `;
 }
 
-// Fallback config page renderer
+// Generic config page renderer.
+// The actual schema-driven form is mounted later by renderSchemaMount().
 function renderConfigPage(page) {
   return `
     <h1>${escapeHTML(page.title)}</h1>
 
     <section class="card">
-      <div class="card-title">${escapeHTML(page.title)}</div>
       <div class="card-description">
-        Project configuration section: <code>${escapeHTML(page.schemaPath || '')}</code>
+        Manage settings
       </div>
 
       <div class="actions">
-        <button onclick="loadConfig()">Load Configuration</button>
         <button onclick="saveConfig()">Save Configuration</button>
       </div>
 
-      <textarea id="configText" spellcheck="false">${escapeHTML(JSON.stringify(getSchemaPathValue(page.schemaPath), null, 2))}</textarea>
+      <div id="schemaForm"></div>
     </section>
   `;
 }
 
-// Change active page and load data if required
+// Change active page and load data/config if required
 async function setPage(page) {
   state.page = page;
   state.error = undefined;
@@ -280,31 +491,16 @@ async function loadConfig(doRender = true) {
   }
 }
 
-// Save config back to backend
+// Save the in-memory config model back to the backend
 async function saveConfig() {
   try {
-    let text = document.getElementById('configText')?.value;
-
-    if (typeof text !== 'string') {
-      throw new Error('Configuration editor is not available');
-    }
-
-    let page = (state.info.pages || []).find((item) => item.id === state.page);
-    let value = JSON.parse(text);
-
-    if (page?.schemaPath !== undefined) {
-      setSchemaPathValue(page.schemaPath, value);
-    } else {
-      state.config = value;
-    }
-
     await api('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(state.config),
     });
 
-    alert('Configuration saved. Restart may be required.');
+    alert('Configuration saved. Restart required for accessory changes to take effect.');
   } catch (error) {
     alert(String(error.message || error));
   }
@@ -356,7 +552,7 @@ function appendLog(entry) {
 
   let div = document.createElement('div');
 
-  div.className = 'log-line ' + escapeClassName(entry.level || 'info');
+  div.className = 'log-line log-' + escapeClassName(entry.level || 'info');
   div.innerHTML = typeof entry.html === 'string' ? entry.html : escapeHTML(entry.message || '');
 
   logs.appendChild(div);
@@ -396,9 +592,9 @@ function startStatusPolling() {
 
       applyTheme(state.info.theme);
 
-      if (latestHomeKit.paired !== state.homekit.paired) {
+      if (JSON.stringify(latestHomeKit) !== JSON.stringify(state.homekit)) {
         state.homekit = latestHomeKit;
-        updatePairingUI();
+        render();
       }
       // eslint-disable-next-line no-unused-vars
     } catch (error) {
@@ -412,32 +608,10 @@ function startUptime() {
   window.setInterval(() => {
     uptimeSeconds++;
 
-    let uptime = document.getElementById('uptime');
-
-    if (uptime !== null) {
+    document.querySelectorAll('.uptime').forEach((uptime) => {
       uptime.textContent = formatUptime(uptimeSeconds);
-    }
+    });
   }, 1000);
-}
-
-// Update only the pairing icon state without full re-render
-function updatePairingUI() {
-  let el = document.querySelector('.pairing-state');
-
-  if (el === null) {
-    return;
-  }
-
-  el.classList.toggle('paired', state.homekit.paired === true);
-  el.classList.toggle('unpaired', state.homekit.paired !== true);
-
-  el.title = state.homekit.paired === true ? 'Reset HomeKit Pairing' : 'Not Paired';
-
-  if (state.homekit.paired === true) {
-    el.setAttribute('onclick', 'resetPairing()');
-  } else {
-    el.removeAttribute('onclick');
-  }
 }
 
 // Format one log entry as safe HTML
@@ -449,7 +623,7 @@ function formatLogLine(entry) {
   let level = escapeClassName(entry.level || 'info');
   let html = typeof entry.html === 'string' ? entry.html : escapeHTML(entry.message || '');
 
-  return `<div class="log-line ${level}">${html}</div>`;
+  return `<div class="log-line log-${level}">${html}</div>`;
 }
 
 // Apply optional project-provided theme colours
@@ -523,7 +697,7 @@ async function restartService() {
 }
 
 // Reset HomeKit pairing
-async function resetPairing() {
+async function resetPairing(username = state.homekit.username) {
   if (confirm('Reset HomeKit pairing? This removes all paired controllers.') !== true) {
     return;
   }
@@ -531,7 +705,7 @@ async function resetPairing() {
   await api('/api/homekit/reset', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: state.homekit.username }),
+    body: JSON.stringify({ username }),
   });
 
   alert('Pairing reset. Restart and re-pair.');
@@ -552,22 +726,6 @@ function getSchemaPathValue(schemaPath) {
   }, state.config);
 }
 
-// Safely set nested config path
-function setSchemaPathValue(schemaPath, value) {
-  let keys = schemaPath.split('.');
-  let target = state.config;
-
-  keys.slice(0, -1).forEach((key) => {
-    if (target[key] === undefined || typeof target[key] !== 'object') {
-      target[key] = {};
-    }
-
-    target = target[key];
-  });
-
-  target[keys.at(-1)] = value;
-}
-
 // Escape HTML safely
 function escapeHTML(value) {
   return String(value ?? '')
@@ -581,6 +739,73 @@ function escapeHTML(value) {
 // Restrict dynamic class names to safe characters
 function escapeClassName(value) {
   return String(value ?? '').replaceAll(/[^a-zA-Z0-9_-]/g, '');
+}
+
+// Safely set value in nested object using path
+function setValueAtPath(obj, path, value) {
+  let ref = obj;
+
+  for (let i = 0; i < path.length - 1; i++) {
+    if (ref[path[i]] === undefined) {
+      ref[path[i]] = typeof path[i + 1] === 'number' ? [] : {};
+    }
+
+    ref = ref[path[i]];
+  }
+
+  ref[path[path.length - 1]] = value;
+}
+
+// Create a default config value from a schema definition
+function getDefaultValue(schema) {
+  if (schema?.default !== undefined) {
+    return schema.default;
+  }
+
+  if (schema?.type === 'object') {
+    let obj = {};
+
+    Object.keys(schema.properties || {}).forEach((key) => {
+      obj[key] = getDefaultValue(schema.properties[key]);
+    });
+
+    return obj;
+  }
+
+  if (schema?.type === 'array') {
+    return [];
+  }
+
+  if (schema?.type === 'boolean') {
+    return false;
+  }
+
+  if (Array.isArray(schema?.enum)) {
+    return schema.enum[0];
+  }
+
+  return undefined;
+}
+
+// Resolve a nested schema section from the root JSON schema using a dot path
+// (e.g. "doors", "options.something"). This mirrors getSchemaPathValue()
+// but operates on the schema definition instead of the config data.
+function getSchemaAtPath(schemaPath) {
+  if (schemaPath === undefined || schemaPath === '') {
+    return state.schema;
+  }
+
+  return schemaPath.split('.').reduce((schema, key) => {
+    if (schema?.type === 'object') {
+      return schema.properties?.[key];
+    }
+
+    if (schema?.type === 'array') {
+      return schema.items;
+    }
+
+    return undefined;
+  }, state.schema);
 }
 
 // Icon mapping
@@ -609,7 +834,14 @@ function homeIcon() {
 
 // SVG settings icon
 function gearIcon() {
-  return '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></svg>';
+  return (
+    '<svg viewBox="0 -1 24 24">' +
+    '<path d="M4 7h16"/>' +
+    '<path d="M4 17h16"/>' +
+    '<circle cx="9" cy="7" r="2"/>' +
+    '<circle cx="15" cy="17" r="2"/>' +
+    '</svg>'
+  );
 }
 
 // SVG list icon
