@@ -1,4 +1,4 @@
-/* global EventSource, alert, confirm, document, fetch, window */
+/* global EventSource, alert, confirm, document, fetch, window, setTimeout, clearTimeout */
 'use strict';
 
 // Runtime UI state shared across all render functions
@@ -16,6 +16,7 @@ let state = {
 
 // Core UI always includes the status page only
 let corePages = [{ id: 'status', title: 'Status', icon: 'home' }];
+let logReconnectTimer = undefined;
 let logStream = undefined;
 let logsPaused = false;
 let logsAutoScroll = true;
@@ -45,7 +46,7 @@ async function load() {
     applyTheme(state.info.theme);
 
     state.homekit = await api('/api/homekit');
-    state.logs = (await api('/api/logs')).logs || [];
+    await loadLogs(false);
   } catch (error) {
     state.error = String(error.message || error);
   }
@@ -373,9 +374,9 @@ function logsCard() {
         <div class="logs-title">Log</div>
 
         <div class="logs-controls">
-          <button title="Pause logs" onclick="togglePause()">Pause</button>
+          <button id="logs-pause" title="Pause logs" onclick="togglePause()">${logsPaused === true ? 'Live' : 'Pause'}</button>
           <button title="Clear logs" onclick="clearLogs()">Clear</button>
-          <button title="Toggle auto-scroll" onclick="toggleScroll()">Scroll</button>
+          <button id="logs-scroll" title="Toggle auto-scroll" onclick="toggleScroll()">${logsAutoScroll === true ? 'Scroll' : 'Manual'}</button>
         </div>
       </div>
 
@@ -514,6 +515,11 @@ function startLogStream() {
 
   logStream = new EventSource('/api/logs/stream');
 
+  logStream.onopen = () => {
+    // When reconnecting after a restart, reload history so startup logs are not missed.
+    loadLogs(true);
+  };
+
   logStream.onmessage = (event) => {
     try {
       let entry = JSON.parse(event.data);
@@ -534,8 +540,35 @@ function startLogStream() {
   };
 
   logStream.onerror = () => {
-    // Browser EventSource reconnects automatically
+    try {
+      logStream.close();
+      // eslint-disable-next-line no-unused-vars
+    } catch (error) {
+      // Empty
+    }
+
+    logStream = undefined;
+
+    if (logReconnectTimer !== undefined) {
+      clearTimeout(logReconnectTimer);
+    }
+
+    logReconnectTimer = setTimeout(() => {
+      logReconnectTimer = undefined;
+      startLogStream();
+    }, 2000);
   };
+}
+
+// Reload current log history from backend
+async function loadLogs(scroll = true) {
+  try {
+    state.logs = (await api('/api/logs')).logs || [];
+    renderLogsOnly(scroll);
+    // eslint-disable-next-line no-unused-vars
+  } catch (error) {
+    // Ignore transient log reload failures
+  }
 }
 
 // Append a single live log entry without re-rendering the full page
@@ -556,6 +589,10 @@ function appendLog(entry) {
   div.innerHTML = typeof entry.html === 'string' ? entry.html : escapeHTML(entry.message || '');
 
   logs.appendChild(div);
+
+  while (logs.children.length > 500) {
+    logs.removeChild(logs.firstChild);
+  }
 
   if (logsAutoScroll === true) {
     logs.scrollTop = logs.scrollHeight;
@@ -656,6 +693,17 @@ function applyTheme(theme) {
 // Toggle live log appending
 function togglePause() {
   logsPaused = logsPaused === true ? false : true;
+
+  let button = document.getElementById('logs-pause');
+
+  if (button !== null) {
+    button.textContent = logsPaused === true ? 'Live' : 'Pause';
+    button.title = logsPaused === true ? 'Resume live logs' : 'Pause logs';
+  }
+
+  if (logsPaused === false) {
+    renderLogsOnly(true);
+  }
 }
 
 // Clear browser-side log view
@@ -667,6 +715,17 @@ function clearLogs() {
 // Toggle automatic scrolling when logs arrive
 function toggleScroll() {
   logsAutoScroll = logsAutoScroll === true ? false : true;
+
+  let button = document.getElementById('logs-scroll');
+
+  if (button !== null) {
+    button.textContent = logsAutoScroll === true ? 'Scroll' : 'Manual';
+    button.title = logsAutoScroll === true ? 'Disable auto-scroll' : 'Enable auto-scroll';
+  }
+
+  if (logsAutoScroll === true) {
+    renderLogsOnly(true);
+  }
 }
 
 // Format uptime seconds into short display string
