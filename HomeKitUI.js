@@ -13,7 +13,7 @@
 // - Provide generic project page data through a single page API endpoint
 // - Handle configuration save, validation, backup, and restore workflows
 // - Provide HomeKit pairing details (QR code, setup URI, pairing state)
-// - Stream Logger history/live entries to the built-in UI
+// - Stream logs from a file, journald or console capture
 // - Support resetting HomeKit pairing data via HAP-NodeJS cleanup
 // - Provide optional hooks for restart and maintenance actions
 //
@@ -44,6 +44,9 @@
 // - Does not manage accessory lifecycle or publishing directly
 // - Host application remains responsible for device creation and runtime control
 // - Resetting HomeKit pairing removes all controllers and requires re-pairing
+// - Explicit log file is preferred when configured
+// - Journald is preferred in auto mode when running under systemd
+// - Console capture is used as fallback for direct/manual runs
 // - Built-in UI is always served from this module's ui folder
 //
 // Mark Hulskamp
@@ -52,11 +55,15 @@
 // Define external module requirements
 import express from 'express';
 import QRCode from 'qrcode';
+import { AnsiUp } from 'ansi_up';
 
 // Define nodejs module requirements
+import console from 'node:console';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import util from 'node:util';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 // Define constants
@@ -73,11 +80,18 @@ const LOG_LEVELS = {
 // Define our HomeKit UI class
 export default class HomeKitUI {
   static DEFAULT_PORT = 8581;
-  static VERSION = '2026.04.27';
+  static VERSION = '2026.04.29';
+
+  // Shared console capture state
+  static #consoleCaptured = false; // Prevent double-patching console.*
+  static #consoleHistory = []; // Recent console output for non-systemd/direct runs
+  static #consoleListeners = new Set(); // Live console listeners for SSE clients
+  static #consoleOriginal = {}; // Original console methods before capture
 
   // Internal data only for this class
+  #ansi = new AnsiUp(); // ANSI output to HTML converter for UI consumers
   #app = undefined; // Express app instance
-  #logListeners = new Map(); // Active SSE response -> logger listener map
+  #logListeners = new Map(); // Active SSE response -> cleanup callback map
   #options = {}; // Runtime options
   #server = undefined; // HTTP server instance
 
@@ -87,6 +101,9 @@ export default class HomeKitUI {
     if (options === null || typeof options !== 'object' || options.constructor !== Object) {
       options = {};
     }
+
+    // Inline styles keep HomeKitUI self-contained and avoid browser-side ansi_up dependency.
+    this.#ansi.use_classes = false;
 
     // Store all runtime options in one internal object so the public class surface
     // remains small. Hooks allow each standalone app to provide its own validation,
@@ -105,7 +122,7 @@ export default class HomeKitUI {
       accessories: [],
       hap: undefined,
       log: undefined,
-      logger: undefined,
+      logs: {},
       onGetPage: undefined,
       onValidateConfig: undefined,
       onSaveConfig: undefined,
@@ -115,18 +132,8 @@ export default class HomeKitUI {
       ...options,
     };
 
-    // Project pages are optional metadata used by the built-in UI to add extra
-    // sidebar entries or schema-backed config sections. Keep them as an array only.
-    if (Array.isArray(this.#options.pages) === false) {
-      this.#options.pages = [];
-    }
-
-    // Multiple accessories are optional. Keep backwards compatibility with the
-    // original single accessory option while allowing standalone apps to expose
-    // more than one independently paired HAP accessory.
-    if (Array.isArray(this.#options.accessories) === false) {
-      this.#options.accessories = [];
-    }
+    this.#normaliseOptions();
+    HomeKitUI.#captureConsole(this.#options.logs.lines);
   }
 
   async start(options = {}) {
@@ -139,13 +146,8 @@ export default class HomeKitUI {
       };
     }
 
-    if (Array.isArray(this.#options.pages) === false) {
-      this.#options.pages = [];
-    }
-
-    if (Array.isArray(this.#options.accessories) === false) {
-      this.#options.accessories = [];
-    }
+    this.#normaliseOptions();
+    HomeKitUI.#captureConsole(this.#options.logs.lines);
 
     // If the HTTP server is already running, don't bind twice. This makes start()
     // safe to call from app initialisation code that may be retried.
@@ -216,14 +218,14 @@ export default class HomeKitUI {
       return false;
     }
 
-    // Remove live logger listeners and close any active log streams before shutting
-    // down the HTTP server.
-    for (let [response, listener] of this.#logListeners) {
-      if (typeof this.#options.logger?.removeListener === 'function') {
-        this.#options.logger.removeListener(listener);
-      }
-
+    // Remove live file/journal/console listeners and close any active log
+    // streams before shutting down the HTTP server.
+    for (let [response, cleanup] of this.#logListeners) {
       try {
+        if (typeof cleanup === 'function') {
+          cleanup();
+        }
+
         response.end();
         // eslint-disable-next-line no-unused-vars
       } catch (error) {
@@ -342,18 +344,18 @@ export default class HomeKitUI {
         throw new Error('Invalid page id');
       }
 
-      // Ensure requested page actually exists in configured pages list
+      // Ensure requested page actually exists in configured pages list.
       if (this.#hasPage(id) === false) {
         response.status(404).json({ error: 'Unknown page' });
         return;
       }
 
-      // Delegate page data generation to host application
-      // This keeps HomeKitUI completely generic and reusable
+      // Delegate page data generation to host application.
+      // This keeps HomeKitUI completely generic and reusable.
       if (typeof this.#options.onGetPage === 'function') {
         let data = await this.#options.onGetPage(id);
 
-        // Always return a plain object to keep frontend logic simple
+        // Always return a plain object to keep frontend logic simple.
         if (data === null || typeof data !== 'object') {
           response.json({});
           return;
@@ -363,7 +365,7 @@ export default class HomeKitUI {
         return;
       }
 
-      // No handler provided, return empty payload
+      // No handler provided, return empty payload.
       response.json({});
     } catch (error) {
       this.#sendError(response, error);
@@ -445,14 +447,25 @@ export default class HomeKitUI {
 
   async #handleLogs(request, response) {
     try {
-      // Prefer the shared Logger interface. This avoids scraping stdout/stderr and
-      // allows logs from before HomeKitUI.start() to be displayed.
-      if (typeof this.#options.logger?.history === 'function') {
-        response.json({ logs: this.#options.logger.history() });
+      let source = await this.#logSource();
+
+      // Explicit file source wins. This allows a host app to point HomeKitUI at any
+      // rotating or application-managed log file.
+      if (source === 'file') {
+        response.json({ logs: await this.#readLogFile(this.#options.logs.file, this.#options.logs.lines) });
         return;
       }
 
-      response.json({ logs: [] });
+      // Journald is preferred in auto mode when running under systemd. It survives
+      // process restarts and avoids relying on in-process memory.
+      if (source === 'journald') {
+        response.json({ logs: await this.#readJournal(this.#options.logs.lines) });
+        return;
+      }
+
+      // Console fallback is useful for direct/manual runs where systemd and a log
+      // file are not available.
+      response.json({ logs: HomeKitUI.#consoleHistory.map((entry) => this.#logEntry(entry.terminal, entry.level, entry.time)) });
     } catch (error) {
       this.#sendError(response, error);
     }
@@ -469,31 +482,34 @@ export default class HomeKitUI {
     response.write('event: connected\n');
     response.write('data: true\n\n');
 
-    // Subscribe to Logger live entries when the host supplied a compatible logger.
-    if (typeof this.#options.logger?.addListener === 'function' && typeof this.#options.logger?.removeListener === 'function') {
-      let listener = (entry) => {
-        try {
-          response.write('data: ' + JSON.stringify(entry) + '\n\n');
-          // eslint-disable-next-line no-unused-vars
-        } catch (error) {
-          if (typeof this.#options.logger?.removeListener === 'function') {
-            this.#options.logger.removeListener(listener);
-          }
+    let source = await this.#logSource();
 
-          this.#logListeners.delete(response);
-        }
+    // Explicit file source wins. `tail -F` follows rotation/replacement better than
+    // `tail -f`, which is useful when the host app or system rotates logs.
+    if (source === 'file') {
+      this.#streamCommand(response, 'tail', ['-n', '0', '-F', this.#options.logs.file]);
+    } else if (source === 'journald') {
+      // Journald stream uses -o cat so ANSI escape codes are preserved for the UI.
+      this.#streamCommand(response, 'journalctl', [...(await this.#journalArgs(0)), '-f']);
+    } else {
+      // Console stream is the last fallback for direct/manual runs.
+      let listener = (entry) => {
+        response.write('data: ' + JSON.stringify(this.#logEntry(entry.terminal, entry.level, entry.time)) + '\n\n');
       };
 
-      this.#logListeners.set(response, listener);
-      this.#options.logger.addListener(listener);
+      HomeKitUI.#consoleListeners.add(listener);
+
+      this.#logListeners.set(response, () => {
+        HomeKitUI.#consoleListeners.delete(listener);
+      });
     }
 
-    // Remove closed clients so we don't leak response handles or logger listeners.
+    // Remove closed clients so we don't leak response handles, child processes, or listeners.
     request.on('close', () => {
-      let listener = this.#logListeners.get(response);
+      let cleanup = this.#logListeners.get(response);
 
-      if (listener !== undefined && typeof this.#options.logger?.removeListener === 'function') {
-        this.#options.logger.removeListener(listener);
+      if (typeof cleanup === 'function') {
+        cleanup();
       }
 
       this.#logListeners.delete(response);
@@ -541,7 +557,6 @@ export default class HomeKitUI {
 
   async #homeKitDetails() {
     let accessories = this.#accessories();
-
     let items = [];
 
     for (let accessory of accessories) {
@@ -653,6 +668,223 @@ export default class HomeKitUI {
     await fs.writeFile(file, JSON.stringify(data, null, 2) + '\n');
   }
 
+  async #readLogFile(file, lines) {
+    // File logs are read as plain text and converted into UI log entries line by line.
+    // This intentionally reads the whole file for simplicity; host apps should pass
+    // a rotated/sensible log file rather than huge archival logs.
+    let content = await fs.readFile(file, 'utf8');
+
+    return content
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .slice(-lines)
+      .map((line) => this.#logEntry(line));
+  }
+
+  async #readJournal(lines) {
+    let entries = [];
+    let buffer = '';
+    let args = await this.#journalArgs(lines);
+
+    await new Promise((resolve) => {
+      let finished = false;
+      let proc = spawn('journalctl', args);
+
+      let finish = () => {
+        if (finished === true) {
+          return;
+        }
+
+        finished = true;
+
+        if (buffer.trim() !== '') {
+          entries.push(this.#logEntry(buffer));
+        }
+
+        resolve();
+      };
+
+      proc.stdout.on('data', (data) => {
+        buffer += String(data);
+
+        let lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        lines.forEach((line) => {
+          if (line.trim() !== '') {
+            entries.push(this.#logEntry(line));
+          }
+        });
+      });
+
+      proc.on('close', finish);
+      proc.on('error', finish);
+    });
+
+    return entries;
+  }
+
+  async #journalArgs(lines) {
+    // Prefer an explicitly supplied systemd unit when configured.
+    // Unit-based journald queries include previous service runs, so UI scrollback works.
+    let unit = typeof this.#options.logs.unit === 'string' && this.#options.logs.unit !== '' ? this.#options.logs.unit : undefined;
+
+    // Try to infer the service unit from /proc/self/cgroup.
+    if (unit === undefined) {
+      try {
+        let cgroup = await fs.readFile('/proc/self/cgroup', 'utf8');
+        let match = cgroup.match(/(?:^|\/)([^/\n]+\.service)(?:\/|$)/);
+
+        if (Array.isArray(match) === true && typeof match[1] === 'string' && match[1] !== '') {
+          unit = match[1];
+        }
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
+    }
+
+    // If cgroup did not expose the unit, ask journald which unit owns this PID.
+    if (unit === undefined) {
+      try {
+        let json = '';
+        await new Promise((resolve) => {
+          let proc = spawn('journalctl', ['_PID=' + process.pid, '-n', '1', '-o', 'json', '--no-pager']);
+
+          proc.stdout.on('data', (data) => {
+            json += String(data);
+          });
+
+          proc.on('close', resolve);
+          proc.on('error', resolve);
+        });
+
+        let entry = JSON.parse(json.trim() || '{}');
+
+        if (typeof entry?._SYSTEMD_UNIT === 'string' && entry._SYSTEMD_UNIT !== '') {
+          unit = entry._SYSTEMD_UNIT;
+        }
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
+    }
+
+    if (unit !== undefined) {
+      return ['-u', unit, '-o', 'cat', '-n', String(lines), '--no-pager'];
+    }
+
+    // Last resort only. Invocation id is intentionally narrow and only shows this run.
+    if (typeof process.env.INVOCATION_ID === 'string' && process.env.INVOCATION_ID !== '') {
+      return ['_SYSTEMD_INVOCATION_ID=' + process.env.INVOCATION_ID, '-o', 'cat', '-n', String(lines), '--no-pager'];
+    }
+
+    return [];
+  }
+
+  async #logSource() {
+    // Log source priority:
+    // 1. Explicit file path (always wins)
+    // 2. journald (preferred under systemd or when explicitly requested)
+    // 3. console fallback (direct/manual runs)
+
+    // Explicit file override
+    if (typeof this.#options.logs.file === 'string' && this.#options.logs.file !== '') {
+      return 'file';
+    }
+
+    // Explicit source selection
+    if (this.#options.logs.source === 'file') {
+      return typeof this.#options.logs.file === 'string' && this.#options.logs.file !== '' ? 'file' : 'console';
+    }
+
+    if (this.#options.logs.source === 'journald') {
+      return (await this.#journalArgs(this.#options.logs.lines)).length > 0 ? 'journald' : 'console';
+    }
+
+    if (this.#options.logs.source === 'console') {
+      return 'console';
+    }
+
+    // Auto mode (default)
+    if ((await this.#journalArgs(this.#options.logs.lines)).length > 0) {
+      return 'journald';
+    }
+
+    return 'console';
+  }
+
+  #streamCommand(response, command, args) {
+    // Stream a child process line-by-line into SSE. Used by both tail and journalctl.
+    let buffer = '';
+    let proc = spawn(command, args);
+
+    let cleanup = () => {
+      try {
+        proc.kill('SIGTERM');
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
+    };
+
+    this.#logListeners.set(response, cleanup);
+
+    proc.stdout.on('data', (data) => {
+      buffer += String(data);
+
+      let lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      lines.forEach((line) => {
+        if (line.trim() !== '') {
+          response.write('data: ' + JSON.stringify(this.#logEntry(line)) + '\n\n');
+        }
+      });
+    });
+
+    proc.on('error', () => {
+      cleanup();
+    });
+  }
+
+  #logEntry(line, level = LOG_LEVELS.INFO, time = new Date().toISOString()) {
+    // Convert raw terminal text into the structured object expected by app.js.
+    return {
+      time,
+      level,
+      message: line,
+      terminal: line,
+      html: this.#ansi.ansi_to_html(line),
+    };
+  }
+
+  #normaliseOptions() {
+    // Normalise option groups after constructor/start merges so callers can provide
+    // partial options without needing to mirror the full defaults object.
+    if (Array.isArray(this.#options.pages) === false) {
+      this.#options.pages = [];
+    }
+
+    if (Array.isArray(this.#options.accessories) === false) {
+      this.#options.accessories = [];
+    }
+
+    if (this.#options.logs === null || typeof this.#options.logs !== 'object' || this.#options.logs.constructor !== Object) {
+      this.#options.logs = {};
+    }
+
+    this.#options.logs = {
+      source: typeof this.#options.logs.source === 'string' && this.#options.logs.source !== '' ? this.#options.logs.source : 'auto',
+      file: typeof this.#options.logs.file === 'string' && this.#options.logs.file !== '' ? this.#options.logs.file : undefined,
+      unit: typeof this.#options.logs.unit === 'string' && this.#options.logs.unit !== '' ? this.#options.logs.unit : undefined,
+      lines:
+        Number.isFinite(Number(this.#options.logs.lines)) === true && Number(this.#options.logs.lines) > 0
+          ? Number(this.#options.logs.lines)
+          : 500,
+    };
+  }
+
   #hasPage(id) {
     // Only allow requests for pages explicitly advertised by the host project.
     // This prevents arbitrary ids from reaching the project's page data hook.
@@ -692,9 +924,59 @@ export default class HomeKitUI {
       return;
     }
 
-    // Use the requested log level when the host logger supports it.
+    // Forward internal HomeKitUI logs to the host application's logger if provided.
+    // This is not used for log streaming, only for UI/service-level messages.
     if (typeof this.#options.log?.[level] === 'function') {
       this.#options.log[level](message, ...args);
     }
+  }
+
+  static #captureConsole(lines = 500) {
+    // Patch console once so direct/manual runs still have a live log source when
+    // journald and file logs are unavailable.
+    if (HomeKitUI.#consoleCaptured === true) {
+      return;
+    }
+
+    HomeKitUI.#consoleCaptured = true;
+    HomeKitUI.#consoleOriginal.log = console.log;
+    HomeKitUI.#consoleOriginal.info = console.info;
+    HomeKitUI.#consoleOriginal.warn = console.warn;
+    HomeKitUI.#consoleOriginal.error = console.error;
+    HomeKitUI.#consoleOriginal.debug = console.debug;
+
+    [
+      ['log', LOG_LEVELS.INFO],
+      ['info', LOG_LEVELS.INFO],
+      ['warn', LOG_LEVELS.WARN],
+      ['error', LOG_LEVELS.ERROR],
+      ['debug', LOG_LEVELS.DEBUG],
+    ].forEach(([method, level]) => {
+      console[method] = (...args) => {
+        let line = util.format(...args);
+        let entry = {
+          time: new Date().toISOString(),
+          level,
+          message: line,
+          terminal: line,
+        };
+
+        HomeKitUI.#consoleHistory.push(entry);
+
+        while (HomeKitUI.#consoleHistory.length > lines) {
+          HomeKitUI.#consoleHistory.shift();
+        }
+
+        HomeKitUI.#consoleListeners.forEach((listener) => {
+          try {
+            listener(entry);
+          } catch {
+            // Empty
+          }
+        });
+
+        HomeKitUI.#consoleOriginal[method](...args);
+      };
+    });
   }
 }
