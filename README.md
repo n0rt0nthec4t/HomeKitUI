@@ -27,6 +27,7 @@ The module is **application-level**, not device-level.
 - HomeKit pairing details (QR code, setup URI)
 - Multi-accessory support
 - Live log streaming (SSE)
+- URL-based navigation with browser history support
 - journald integration (systemd-aware)
 - File-based log support
 - Console capture fallback
@@ -109,6 +110,16 @@ logs: {
 
 ---
 
+## Navigation
+
+`HomeKitUI` supports URL-based navigation using hash routing.
+
+- Pages can be accessed directly via URL (e.g. `/#dashboard`)
+- The current page is preserved on browser refresh
+- Browser back/forward navigation is supported
+
+This enables deep linking and improves usability when accessing the UI remotely.
+
 ## API Endpoints
 
 | Endpoint | Description |
@@ -129,6 +140,8 @@ logs: {
 ---
 
 ## Custom Pages
+
+Pages can be accessed directly via URL using their `id` (e.g. `/#status`).
 
 ```js
 pages: [
@@ -188,11 +201,3 @@ Stops the web server and cleans up log streams.
 ```js
 static VERSION = '2026.04.29';
 ```
-
----
-
-## License
-
-Apache License 2.0
-
-http://www.apache.org/licenses/LICENSE-2.0

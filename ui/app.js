@@ -1,9 +1,41 @@
+// Module: HomeKitUI (Frontend App)
+//
+// Client-side application for the HomeKitUI web interface.
+// Responsible for rendering the UI, managing navigation state,
+// interacting with backend API endpoints, and handling live updates.
+//
+// Responsibilities:
+// - Manage application state (current page, config, logs, HomeKit data)
+// - Handle page navigation (including URL hash routing and history)
+// - Fetch data from HomeKitUI API endpoints
+// - Render built-in pages (status, config, logs, HomeKit)
+// - Render project-specific pages via `/api/page/:id`
+// - Handle configuration editing and save workflows
+// - Stream logs via Server-Sent Events (SSE)
+// - Provide error handling and user feedback
+//
+// Features:
+// - URL hash-based navigation (e.g. /#dashboard)
+// - Browser refresh persistence of selected page
+// - Back/forward browser navigation support
+// - Dynamic page loading and caching
+// - Live log streaming with automatic reconnect
+//
+// Notes:
+// - Designed to work with the HomeKitUI backend module
+// - No external frontend framework (vanilla JS only)
+// - All UI rendering is handled via DOM updates
+// - Project-specific pages are data-driven or HTML-rendered
+//
+// Code version 2026.04.30
+// Mark Hulskamp
+
 /* global EventSource, alert, confirm, document, fetch, window, setTimeout, clearTimeout */
 'use strict';
 
 // Runtime UI state shared across all render functions
 let state = {
-  page: 'status',
+  page: window.location.hash.replace('#', '') || 'status',
   info: {},
   homekit: {},
   config: {},
@@ -49,6 +81,14 @@ async function load() {
     await loadLogs(false);
   } catch (error) {
     state.error = String(error.message || error);
+  }
+
+  if (state.page !== 'status') {
+    await loadPageData(state.page);
+
+    if (Object.keys(state.config).length === 0) {
+      await loadConfig(false);
+    }
   }
 
   render();
@@ -130,25 +170,18 @@ function renderSchemaPage(container, schema, value, path = []) {
 }
 
 // Render an array field from schema.items.
-// Each item is rendered as a generic config card and can be added or removed.
+// Object arrays are rendered as config cards, primitive arrays as compact fields.
 function renderSchemaArray(container, schema, value = [], path) {
+  if (schema?.items?.type !== 'object') {
+    return renderPrimitiveArray(container, schema, value, path);
+  }
+
   if (Array.isArray(value) === false) {
     value = [];
   }
 
   let wrapper = document.createElement('div');
   wrapper.className = 'config-list';
-
-  let addBtn = document.createElement('button');
-  addBtn.className = 'primary';
-  addBtn.textContent = '+ Add';
-  addBtn.onclick = () => {
-    value.push(getDefaultValue(schema.items));
-    setValueAtPath(state.config, path, value);
-    render();
-  };
-
-  wrapper.appendChild(addBtn);
 
   value.forEach((item, index) => {
     let row = document.createElement('div');
@@ -185,6 +218,61 @@ function renderSchemaArray(container, schema, value = [], path) {
   container.appendChild(wrapper);
 }
 
+// Render an array of primitive values as a single comma-separated field.
+// This keeps simple lists such as GPIO pins compact in the generated form.
+function renderPrimitiveArray(container, schema, value = [], path) {
+  if (Array.isArray(value) === false) {
+    value = value === undefined ? [] : [value];
+  }
+
+  let itemSchema = schema?.items || {};
+  let label = document.createElement('div');
+  label.className = 'list-title';
+  label.textContent = schema.title || path[path.length - 1];
+
+  let input = document.createElement('input');
+  input.type = 'text';
+  input.value = value.join(', ');
+
+  let commit = () => {
+    let newValue = input.value
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item !== '')
+      .map((item) => {
+        if (itemSchema.type === 'number' || itemSchema.type === 'integer') {
+          let number = Number(item);
+
+          if (Number.isFinite(number) === false) {
+            return undefined;
+          }
+
+          if (Number.isFinite(Number(itemSchema.minimum)) === true && number < Number(itemSchema.minimum)) {
+            number = Number(itemSchema.minimum);
+          }
+
+          if (Number.isFinite(Number(itemSchema.maximum)) === true && number > Number(itemSchema.maximum)) {
+            number = Number(itemSchema.maximum);
+          }
+
+          return itemSchema.type === 'integer' ? Math.trunc(number) : number;
+        }
+
+        return item;
+      })
+      .filter((item) => item !== undefined);
+
+    input.value = newValue.join(', ');
+    setValueAtPath(state.config, path, newValue);
+  };
+
+  input.onchange = commit;
+  input.onblur = commit;
+
+  container.appendChild(label);
+  container.appendChild(input);
+}
+
 // Render an object field from schema.properties.
 // Fields are rendered in schema order as generic form rows.
 function renderSchemaObject(container, schema, value = {}, path) {
@@ -197,7 +285,7 @@ function renderSchemaObject(container, schema, value = {}, path) {
     let fieldWrapper = document.createElement('div');
     fieldWrapper.className = 'config-row';
 
-    renderSchemaField(fieldWrapper, fieldSchema, fieldValue, [...path, key]);
+    renderSchemaPage(fieldWrapper, fieldSchema, fieldValue, [...path, key]);
 
     container.appendChild(fieldWrapper);
   });
@@ -211,6 +299,27 @@ function renderSchemaField(container, schema = {}, value, path) {
   label.textContent = schema.title || path[path.length - 1];
 
   let input;
+
+  // Normalise number/integer values against schema constraints
+  let normaliseNumber = (rawValue) => {
+    let newValue = rawValue === '' ? undefined : Number(rawValue);
+
+    if (newValue !== undefined) {
+      if (Number.isFinite(Number(schema.minimum)) === true && newValue < Number(schema.minimum)) {
+        newValue = Number(schema.minimum);
+      }
+
+      if (Number.isFinite(Number(schema.maximum)) === true && newValue > Number(schema.maximum)) {
+        newValue = Number(schema.maximum);
+      }
+
+      if (schema.type === 'integer') {
+        newValue = Math.trunc(newValue);
+      }
+    }
+
+    return newValue;
+  };
 
   // ENUM (select)
   if (Array.isArray(schema.enum) === true) {
@@ -254,6 +363,14 @@ function renderSchemaField(container, schema = {}, value, path) {
     if (schema.type === 'integer') {
       input.step = '1';
     }
+
+    // Live clamp numeric input so manually typed values cannot remain outside bounds
+    input.oninput = () => {
+      let newValue = normaliseNumber(input.value);
+
+      input.value = newValue ?? '';
+      setValueAtPath(state.config, path, newValue);
+    };
   }
 
   // STRING (default)
@@ -278,13 +395,16 @@ function renderSchemaField(container, schema = {}, value, path) {
   }
 
   // CHANGE HANDLER (final value commit)
-  input.onchange = () => {
+  // Uses both onchange and onblur to ensure validation runs when leaving the field,
+  // as some browsers do not fire change for invalid number inputs.
+  let commit = () => {
     let newValue;
 
     if (schema.type === 'boolean') {
       newValue = input.checked;
     } else if (schema.type === 'number' || schema.type === 'integer') {
-      newValue = input.value === '' ? undefined : Number(input.value);
+      newValue = normaliseNumber(input.value);
+      input.value = newValue ?? '';
     } else {
       newValue = input.value;
     }
@@ -292,8 +412,26 @@ function renderSchemaField(container, schema = {}, value, path) {
     setValueAtPath(state.config, path, newValue);
   };
 
+  input.onchange = commit;
+  input.onblur = commit;
+
   container.appendChild(label);
   container.appendChild(input);
+}
+
+// Adds a new object entry to a schema-backed config array
+function addSchemaItem(schemaPath) {
+  let path = schemaPath.split('.');
+  let value = getSchemaPathValue(schemaPath);
+  let schema = getSchemaAtPath(schemaPath);
+
+  if (Array.isArray(value) === false || schema?.items === undefined) {
+    return;
+  }
+
+  value.push(getDefaultValue(schema.items));
+  setValueAtPath(state.config, path, value);
+  render();
 }
 
 // Status page combines HomeKit pairing cards, app actions, and logs
@@ -386,7 +524,8 @@ function logsCard() {
 }
 
 // Project-specific page renderer.
-// HomeKitUI remains generic by rendering list data or schema-backed config sections.
+// HomeKitUI remains generic by rendering host-provided HTML, list data,
+// or schema-backed config sections.
 function projectPage() {
   let page = (state.info.pages || []).find((item) => item.id === state.page);
 
@@ -395,6 +534,14 @@ function projectPage() {
   }
 
   let data = state.pageData[page.id];
+
+  if (data !== undefined && data !== null && data.type === 'html' && typeof data.html === 'string') {
+    return `
+    <h1>${escapeHTML(page.title)}</h1>
+    ${typeof data.css === 'string' && data.css !== '' ? `<style>${data.css}</style>` : ''}
+    ${data.html}
+  `;
+  }
 
   if (data !== undefined && data !== null && data.type === 'list' && Array.isArray(data.items) === true) {
     return renderListPage(page, data);
@@ -434,16 +581,27 @@ function renderListPage(page, data) {
 // Generic config page renderer.
 // The actual schema-driven form is mounted later by renderSchemaMount().
 function renderConfigPage(page) {
+  let addButton = '';
+
+  if (page?.schemaPath !== undefined) {
+    let schema = getSchemaAtPath(page.schemaPath);
+
+    if (schema?.type === 'array' && schema?.items?.type === 'object') {
+      addButton = `<button class="secondary" onclick="addSchemaItem('${escapeHTML(page.schemaPath)}')">+ Add</button>`;
+    }
+  }
+
   return `
     <h1>${escapeHTML(page.title)}</h1>
 
     <section class="card">
-      <div class="card-description">
-        Manage settings
-      </div>
+      <div class="config-page-header">
+        <div class="card-description">Manage settings</div>
 
-      <div class="actions">
-        <button onclick="saveConfig()">Save Configuration</button>
+        <div class="actions">
+          <button onclick="saveConfig()">Save Configuration</button>
+          ${addButton}
+        </div>
       </div>
 
       <div id="schemaForm"></div>
@@ -455,6 +613,10 @@ function renderConfigPage(page) {
 async function setPage(page) {
   state.page = page;
   state.error = undefined;
+
+  if (window.location.hash !== '#' + page) {
+    window.location.hash = page;
+  }
 
   if (page !== 'status') {
     await loadPageData(page);
@@ -937,6 +1099,14 @@ window.saveConfig = saveConfig;
 window.togglePause = togglePause;
 window.clearLogs = clearLogs;
 window.toggleScroll = toggleScroll;
+window.addSchemaItem = addSchemaItem;
+window.addEventListener('hashchange', async () => {
+  let page = window.location.hash.replace('#', '') || 'status';
+  let exists = (state.info.pages || []).some((p) => p.id === page) || page === 'status';
+  if (exists === true && page !== state.page) {
+    await setPage(page);
+  }
+});
 
 // Start UI
 load();

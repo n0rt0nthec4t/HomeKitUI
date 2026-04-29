@@ -72,6 +72,7 @@ const STATIC_PATH = path.join(__dirname, 'ui');
 
 const LOG_LEVELS = {
   INFO: 'info',
+  SUCCESS: 'success',
   WARN: 'warn',
   ERROR: 'error',
   DEBUG: 'debug',
@@ -80,7 +81,7 @@ const LOG_LEVELS = {
 // Define our HomeKit UI class
 export default class HomeKitUI {
   static DEFAULT_PORT = 8581;
-  static VERSION = '2026.04.29';
+  static VERSION = '2026.04.30';
 
   // Shared console capture state
   static #consoleCaptured = false; // Prevent double-patching console.*
@@ -207,7 +208,11 @@ export default class HomeKitUI {
       }
     });
 
-    this.#log(LOG_LEVELS.INFO, 'HomeKitUI listening on port %s', this.#options.port);
+    this.#log(LOG_LEVELS.SUCCESS, 'Setup HomeKitUI for "%s"', this.#options.name);
+    this.#log(LOG_LEVELS.INFO, '  += Listening on port "%s"', this.#options.port);
+    this.#sanitisePages(this.#options.pages).forEach((page) => {
+      this.#log(LOG_LEVELS.DEBUG, '  += Added page "%s"', page.title);
+    });
     return true;
   }
 

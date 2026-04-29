@@ -168,10 +168,10 @@ h1 {
 .card,
 .pairing-card {
   background: var(--card);
-  border: 1px solid rgba(0, 0, 0, 0.04);
+  border: 1px solid rgba(0, 0, 0, 0.06);
   border-radius: 10px;
   padding: 18px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.045);
 }
 
 .pairing-card {
@@ -424,9 +424,27 @@ h1 {
   margin-bottom: 14px;
 }
 
+/* Config header (Save + Add layout) */
+.config-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.config-page-header .card-description {
+  margin-bottom: 0;
+}
+
+.config-page-header .actions {
+  margin-bottom: 0;
+  flex-shrink: 0;
+}
+
 .actions {
   display: flex;
-  gap: 10px;
+  gap: 12px;
   margin-bottom: 16px;
 }
 
@@ -472,10 +490,12 @@ button.secondary:hover {
 
 /* CARD PER ITEM */
 .config-card {
+  background: #ffffff;
   padding: 16px;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  border: 1px solid rgba(0,0,0,0.06);
 }
 
 .config-card-header {
@@ -483,12 +503,23 @@ button.secondary:hover {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid rgba(0,0,0,0.05);
+  padding-bottom: 8px;
+}
+
+.config-card-header button {
+  opacity: 0.7;
+}
+
+.config-card-header button:hover {
+  opacity: 1;
 }
 
 .config-card-title {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 600;
+  color: var(--text);
 }
 
 /* FORM ROWS */
@@ -497,10 +528,14 @@ button.secondary:hover {
   grid-template-columns: minmax(180px, 1fr) 220px;
   gap: 16px;
   align-items: center;
-  padding: 10px 12px;
+  padding: 8px 12px;
   border-radius: 8px;
   background: #f7f8fa;
   border: 1px solid rgba(0, 0, 0, 0.04);
+}
+
+.config-row:first-of-type {
+  background: #eef2f7;
 }
 
 .config-row .list-title {
@@ -511,13 +546,27 @@ button.secondary:hover {
 .config-row input,
 .config-row select {
   width: 100%;
-  min-height: 32px;
-  border: 1px solid var(--border);
+  min-height: 36px;
+  border: 1px solid #d6d6db;
   border-radius: 7px;
   background: #ffffff;
   color: var(--text);
   padding: 5px 8px;
   font-size: 13px;
+}
+
+.config-row:hover {
+  background: #eef2f7;
+}
+
+.config-row input:focus,
+.config-row select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.config-row input[type="checkbox"] {
+  transform: scale(0.9);
 }
 
 /* ERROR BLOCK */
@@ -596,6 +645,10 @@ code {
 
   .config-card-header {
     align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .config-page-header {
     flex-direction: column;
   }
 }
