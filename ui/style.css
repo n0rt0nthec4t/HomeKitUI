@@ -324,7 +324,6 @@ h1 {
   font-size: 13px;
   line-height: 1.45;
   white-space: pre;
-  scroll-behavior: smooth;
   scrollbar-width: thin;
   scrollbar-color: #6b7280 #1f2933;
 }

@@ -911,6 +911,10 @@ export default class HomeKitUI {
         icon: typeof page.icon === 'string' && page.icon !== '' ? page.icon : undefined,
         svg: typeof page.svg === 'string' && page.svg !== '' ? page.svg : undefined,
         schemaPath: typeof page.schemaPath === 'string' && page.schemaPath !== '' ? page.schemaPath : undefined,
+        refreshInterval:
+          Number.isFinite(Number(page.refreshInterval)) === true && Number(page.refreshInterval) > 0
+            ? Number(page.refreshInterval)
+            : undefined,
       }))
       .filter((page) => page.id !== undefined && page.title !== undefined);
   }

@@ -30,7 +30,7 @@
 // Code version 2026.04.30
 // Mark Hulskamp
 
-/* global EventSource, alert, confirm, document, fetch, window, setTimeout, clearTimeout */
+/* global EventSource, alert, confirm, document, fetch, window */
 'use strict';
 
 // Runtime UI state shared across all render functions
@@ -42,6 +42,7 @@ let state = {
   schema: {},
   uiSchema: {},
   pageData: {},
+  collapse: {},
   logs: [],
   error: undefined,
 };
@@ -53,6 +54,10 @@ let logStream = undefined;
 let logsPaused = false;
 let logsAutoScroll = true;
 let uptimeSeconds = 0;
+let runtimeTimer = undefined;
+let lastStatusPoll = 0;
+let lastPageRefresh = 0;
+let logScrollTop = 0;
 
 // Simple API wrapper with error handling
 async function api(apiPath, options = {}) {
@@ -123,8 +128,9 @@ function render() {
     </main>
   `;
 
-  renderLogsOnly(false);
+  renderLogsOnly(true);
   renderSchemaMount();
+  restoreCollapseState();
 }
 
 // Render schema-backed form content into the current page after the main
@@ -611,6 +617,12 @@ function renderConfigPage(page) {
 
 // Change active page and load data/config if required
 async function setPage(page) {
+  let logs = document.getElementById('logs');
+
+  if (logs !== null) {
+    logScrollTop = logs.scrollTop;
+  }
+
   state.page = page;
   state.error = undefined;
 
@@ -626,6 +638,7 @@ async function setPage(page) {
     }
   }
 
+  lastPageRefresh = 0;
   render();
 }
 
@@ -712,10 +725,10 @@ function startLogStream() {
     logStream = undefined;
 
     if (logReconnectTimer !== undefined) {
-      clearTimeout(logReconnectTimer);
+      window.clearTimeout(logReconnectTimer);
     }
 
-    logReconnectTimer = setTimeout(() => {
+    logReconnectTimer = window.setTimeout(() => {
       logReconnectTimer = undefined;
       startLogStream();
     }, 2000);
@@ -757,7 +770,7 @@ function appendLog(entry) {
   }
 
   if (logsAutoScroll === true) {
-    logs.scrollTop = logs.scrollHeight;
+    logs.scrollTop = logs.scrollHeight - logs.clientHeight;
   }
 }
 
@@ -771,45 +784,79 @@ function renderLogsOnly(scroll = true) {
 
   logs.innerHTML = state.logs.map(formatLogLine).join('');
 
-  if (scroll === true && logsAutoScroll === true) {
-    logs.scrollTop = logs.scrollHeight;
+  if (scroll !== true || logsAutoScroll !== true) {
+    logs.scrollTop = logScrollTop;
+    return;
   }
+
+  window.setTimeout(() => {
+    logs.scrollTop = logs.scrollHeight - logs.clientHeight;
+  }, 0);
 }
 
-// Poll backend status periodically while uptime is updated locally every second
-function startStatusPolling() {
-  window.setInterval(async () => {
-    try {
-      let latestInfo = await api('/api/info');
-      let latestHomeKit = await api('/api/homekit');
+// Starts the shared frontend runtime timer.
+// Handles lightweight local updates every second, plus slower backend polling
+// for HomeKit status and page-specific refreshes. This avoids multiple timers
+// competing with each other as more dynamic pages are added.
+function startRuntimeTimer() {
+  if (runtimeTimer !== undefined) {
+    return;
+  }
 
-      state.info = latestInfo;
-
-      if (Number.isFinite(Number(latestInfo?.uptime)) === true) {
-        uptimeSeconds = Number(latestInfo.uptime);
-      }
-
-      applyTheme(state.info.theme);
-
-      if (JSON.stringify(latestHomeKit) !== JSON.stringify(state.homekit)) {
-        state.homekit = latestHomeKit;
-        render();
-      }
-      // eslint-disable-next-line no-unused-vars
-    } catch (error) {
-      // Ignore transient failures
-    }
-  }, 30000);
-}
-
-// Update uptime locally so the status card feels live without polling every second
-function startUptime() {
-  window.setInterval(() => {
+  runtimeTimer = window.setInterval(async () => {
     uptimeSeconds++;
 
     document.querySelectorAll('.uptime').forEach((uptime) => {
       uptime.textContent = formatUptime(uptimeSeconds);
     });
+
+    let now = Date.now();
+
+    // Poll general HomeKit/UI status every 30 seconds.
+    if (now - lastStatusPoll >= 30000) {
+      lastStatusPoll = now;
+
+      try {
+        let latestInfo = await api('/api/info');
+        let latestHomeKit = await api('/api/homekit');
+
+        state.info = latestInfo;
+
+        if (Number.isFinite(Number(latestInfo?.uptime)) === true) {
+          uptimeSeconds = Number(latestInfo.uptime);
+        }
+
+        applyTheme(state.info.theme);
+
+        if (JSON.stringify(latestHomeKit) !== JSON.stringify(state.homekit)) {
+          state.homekit = latestHomeKit;
+
+          if (state.page === 'status') {
+            render();
+          }
+        }
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Ignore transient failures
+      }
+    }
+
+    // Refresh dynamic project pages that request periodic updates.
+    let page = (state.info.pages || []).find((item) => item.id === state.page);
+    let refreshInterval = Number(page?.refreshInterval);
+
+    if (
+      state.page !== 'status' &&
+      page?.schemaPath === undefined &&
+      Number.isFinite(refreshInterval) === true &&
+      refreshInterval > 0 &&
+      now - lastPageRefresh >= refreshInterval
+    ) {
+      lastPageRefresh = now;
+
+      await loadPageData(page.id);
+      render();
+    }
   }, 1000);
 }
 
@@ -888,6 +935,40 @@ function toggleScroll() {
   if (logsAutoScroll === true) {
     renderLogsOnly(true);
   }
+}
+
+// Toggle a project-provided collapsible section.
+// Open state is stored so dynamic page refreshes can re-apply it after render().
+function toggleCollapse(id) {
+  let element = document.getElementById(id);
+
+  if (element === null) {
+    return;
+  }
+
+  state.collapse[id] = state.collapse[id] === true ? false : true;
+  element.classList.toggle('open', state.collapse[id] === true);
+}
+
+// Re-apply stored collapse state after a page re-render.
+function restoreCollapseState() {
+  if (typeof state.collapse !== 'object') {
+    return;
+  }
+
+  Object.keys(state.collapse).forEach((id) => {
+    let isOpen = state.collapse[id] === true;
+
+    // Restore panel
+    let element = document.getElementById(id);
+    if (element !== null) {
+      element.classList.toggle('open', isOpen);
+    }
+
+    // Restore ALL matching toggle buttons
+    let buttons = document.querySelectorAll(`[data-collapse="${id}"]`);
+    buttons.forEach((btn) => btn.classList.toggle('open', isOpen));
+  });
 }
 
 // Format uptime seconds into short display string
@@ -1099,6 +1180,7 @@ window.saveConfig = saveConfig;
 window.togglePause = togglePause;
 window.clearLogs = clearLogs;
 window.toggleScroll = toggleScroll;
+window.toggleCollapse = toggleCollapse;
 window.addSchemaItem = addSchemaItem;
 window.addEventListener('hashchange', async () => {
   let page = window.location.hash.replace('#', '') || 'status';
@@ -1110,5 +1192,4 @@ window.addEventListener('hashchange', async () => {
 
 // Start UI
 load();
-startStatusPolling();
-startUptime();
+startRuntimeTimer();
