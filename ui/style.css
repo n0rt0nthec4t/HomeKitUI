@@ -448,15 +448,19 @@ h1 {
 }
 
 button.primary,
-button.secondary,
-.actions button {
+button.secondary {
   border: 0;
   border-radius: 8px;
   cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, opacity 0.2s ease;
 }
 
-button.primary,
-.actions button {
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
   background: var(--accent);
   color: #ffffff;
   padding: 9px 13px;
@@ -469,7 +473,7 @@ button.secondary {
   padding: 7px 10px;
 }
 
-button.secondary:hover {
+button.secondary:hover:not(:disabled) {
   background: #f1f3f5;
   color: var(--text);
 }

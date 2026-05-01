@@ -27,7 +27,7 @@
 // - All UI rendering is handled via DOM updates
 // - Project-specific pages are data-driven or HTML-rendered
 //
-// Code version 2026.04.30
+// Code version 2026.05.02
 // Mark Hulskamp
 
 /* global EventSource, alert, confirm, document, fetch, window */
@@ -45,6 +45,7 @@ let state = {
   collapse: {},
   logs: [],
   error: undefined,
+  changedPaths: new Set(),
 };
 
 // Core UI always includes the status page only
@@ -368,15 +369,9 @@ function renderSchemaField(container, schema = {}, value, path) {
 
     if (schema.type === 'integer') {
       input.step = '1';
+    } else {
+      input.step = 'any';
     }
-
-    // Live clamp numeric input so manually typed values cannot remain outside bounds
-    input.oninput = () => {
-      let newValue = normaliseNumber(input.value);
-
-      input.value = newValue ?? '';
-      setValueAtPath(state.config, path, newValue);
-    };
   }
 
   // STRING (default)
@@ -533,6 +528,7 @@ function logsCard() {
 // HomeKitUI remains generic by rendering host-provided HTML, list data,
 // or schema-backed config sections.
 function projectPage() {
+  // Find the active page definition
   let page = (state.info.pages || []).find((item) => item.id === state.page);
 
   if (page === undefined) {
@@ -541,54 +537,55 @@ function projectPage() {
 
   let data = state.pageData[page.id];
 
+  // HTML page (fully rendered by backend)
   if (data !== undefined && data !== null && data.type === 'html' && typeof data.html === 'string') {
     return `
-    <h1>${escapeHTML(page.title)}</h1>
-    ${typeof data.css === 'string' && data.css !== '' ? `<style>${data.css}</style>` : ''}
-    ${data.html}
-  `;
+      <h1>${escapeHTML(page.title)}</h1>
+      ${typeof data.css === 'string' && data.css !== '' ? `<style>${data.css}</style>` : ''}
+      ${data.html}
+    `;
   }
 
+  // LIST page (inline rendering)
   if (data !== undefined && data !== null && data.type === 'list' && Array.isArray(data.items) === true) {
-    return renderListPage(page, data);
+    return `
+      <h1>${escapeHTML(page.title)}</h1>
+
+      <section class="card">
+        <div class="card-title">${escapeHTML(page.title)}</div>
+
+        <div class="list">
+          ${data.items
+            .map((item) => {
+              // Render each row safely
+              return `
+                <div class="list-row">
+                  <div>
+                    <div class="list-title">${escapeHTML(item.title || '')}</div>
+                    <div class="list-sub">${escapeHTML(item.subtitle || '')}</div>
+                  </div>
+
+                  ${item.value !== undefined ? `<div class="list-value">${escapeHTML(String(item.value))}</div>` : ''}
+                </div>
+              `;
+            })
+            .join('')}
+        </div>
+      </section>
+    `;
   }
 
+  // Default: schema-driven config page
   return renderConfigPage(page);
-}
-
-// Generic list page renderer for host-provided list data
-function renderListPage(page, data) {
-  return `
-    <h1>${escapeHTML(page.title)}</h1>
-
-    <section class="card">
-      <div class="card-title">${escapeHTML(page.title)}</div>
-
-      <div class="list">
-        ${data.items
-          .map(
-            (item) => `
-              <div class="list-row">
-                <div>
-                  <div class="list-title">${escapeHTML(item.title || '')}</div>
-                  <div class="list-sub">${escapeHTML(item.subtitle || '')}</div>
-                </div>
-
-                ${item.value !== undefined ? `<div class="list-value">${escapeHTML(String(item.value))}</div>` : ''}
-              </div>
-            `,
-          )
-          .join('')}
-      </div>
-    </section>
-  `;
 }
 
 // Generic config page renderer.
 // The actual schema-driven form is mounted later by renderSchemaMount().
 function renderConfigPage(page) {
   let addButton = '';
+  let hasChanges = state.changedPaths.size > 0;
 
+  // Array-backed config pages get an Add button.
   if (page?.schemaPath !== undefined) {
     let schema = getSchemaAtPath(page.schemaPath);
 
@@ -605,7 +602,15 @@ function renderConfigPage(page) {
         <div class="card-description">Manage settings</div>
 
         <div class="actions">
-          <button onclick="saveConfig()">Save Configuration</button>
+          <button
+            id="save-config"
+            class="${hasChanges === true ? 'primary' : 'secondary'}"
+            ${hasChanges === true ? '' : 'disabled'}
+            onclick="saveConfig()"
+          >
+            ${hasChanges === true ? 'Save Changes' : 'No Changes'}
+          </button>
+
           ${addButton}
         </div>
       </div>
@@ -670,14 +675,68 @@ async function loadConfig(doRender = true) {
 // Save the in-memory config model back to the backend
 async function saveConfig() {
   try {
+    // Nothing changed, so there is nothing to save.
+    if (state.changedPaths.size === 0) {
+      return;
+    }
+
+    // Determine the active page so we can honour any page-level override
+    let page = (state.info.pages || []).find((item) => item.id === state.page);
+
+    // Default: assume no restart required unless proven otherwise
+    let restartRequired = false;
+
+    // Page-level override:
+    // If explicitly set to false, we NEVER require restart for this page
+    if (page?.restartRequired !== false) {
+      // Evaluate each changed config path against schema metadata
+      restartRequired = [...state.changedPaths].some((changedPath) => {
+        // Break path into segments so we can walk up the schema tree
+        let parts = changedPath.split('.');
+
+        while (parts.length > 0) {
+          // Resolve schema at current depth (field -> parent -> parent...)
+          let schema = getSchemaAtPath(parts.join('.'));
+
+          if (schema !== undefined) {
+            // Explicit override: this field (or parent) does NOT require restart
+            if (schema.restartRequired === false) {
+              return false;
+            }
+
+            // Explicit override: this field (or parent) DOES require restart
+            if (schema.restartRequired === true) {
+              return true;
+            }
+          }
+
+          // Move up one level (e.g. options.flowRate -> options)
+          parts.pop();
+        }
+
+        // No explicit schema override found
+        // Default to safe behaviour: restart required
+        return true;
+      });
+    }
+
+    // Persist updated configuration to backend
     await api('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(state.config),
     });
 
-    alert('Configuration saved. Restart required for accessory changes to take effect.');
+    // Clear tracked changes after successful save
+    state.changedPaths.clear();
+    updateSaveButton();
+
+    // Only show restart prompt when required
+    if (restartRequired === true) {
+      alert('Configuration saved. Restart required for changes to take effect.');
+    }
   } catch (error) {
+    // Surface any API/save errors to the user
     alert(String(error.message || error));
   }
 }
@@ -778,17 +837,37 @@ function appendLog(entry) {
 function renderLogsOnly(scroll = true) {
   let logs = document.getElementById('logs');
 
+  // Logs element is not present on the current page/render.
   if (logs === null) {
     return;
   }
 
-  logs.innerHTML = state.logs.map(formatLogLine).join('');
+  // Rebuild the current buffered log history as safe HTML.
+  logs.innerHTML = state.logs
+    .map((entry) => {
+      // Ignore invalid log entries.
+      if (entry === null || typeof entry !== 'object') {
+        return '';
+      }
 
+      // Restrict level to safe class-name characters.
+      let level = escapeClassName(entry.level || 'info');
+
+      // Prefer pre-rendered HTML from backend, otherwise escape plain text.
+      let html = typeof entry.html === 'string' ? entry.html : escapeHTML(entry.message || '');
+
+      return '<div class="log-line log-' + level + '">' + html + '</div>';
+    })
+    .join('');
+
+  // Restore previous manual scroll position if auto-scroll is disabled
+  // or if caller explicitly requested no scrolling.
   if (scroll !== true || logsAutoScroll !== true) {
     logs.scrollTop = logScrollTop;
     return;
   }
 
+  // Defer scroll until after DOM has been updated.
   window.setTimeout(() => {
     logs.scrollTop = logs.scrollHeight - logs.clientHeight;
   }, 0);
@@ -858,18 +937,6 @@ function startRuntimeTimer() {
       render();
     }
   }, 1000);
-}
-
-// Format one log entry as safe HTML
-function formatLogLine(entry) {
-  if (entry === null || typeof entry !== 'object') {
-    return '';
-  }
-
-  let level = escapeClassName(entry.level || 'info');
-  let html = typeof entry.html === 'string' ? entry.html : escapeHTML(entry.message || '');
-
-  return `<div class="log-line log-${level}">${html}</div>`;
 }
 
 // Apply optional project-provided theme colours
@@ -1028,6 +1095,31 @@ function getSchemaPathValue(schemaPath) {
   }, state.config);
 }
 
+// Update the Save Configuration button state.
+// Dynamically switches styling, label, and enabled state based on whether
+// any config fields have been modified (tracked via state.changedPaths).
+// Called after render() to keep the button in sync with user edits.
+function updateSaveButton() {
+  let button = document.getElementById('save-config');
+
+  // Save button is only present on schema/config pages.
+  if (button === null) {
+    return;
+  }
+
+  // Any tracked config path means the form has unsaved changes.
+  let hasChanges = state.changedPaths.size > 0;
+
+  // Use primary styling only when there are changes to save.
+  button.className = hasChanges === true ? 'primary' : 'secondary';
+
+  // Prevent pointless saves when nothing has changed.
+  button.disabled = hasChanges !== true;
+
+  // Make the button state obvious to the user.
+  button.textContent = hasChanges === true ? 'Save Changes' : 'No Changes';
+}
+
 // Escape HTML safely
 function escapeHTML(value) {
   return String(value ?? '')
@@ -1056,6 +1148,14 @@ function setValueAtPath(obj, path, value) {
   }
 
   ref[path[path.length - 1]] = value;
+
+  // Track changed path for restart logic.
+  if (Array.isArray(path) === true && path.length > 0) {
+    state.changedPaths.add(path.join('.'));
+  }
+
+  // Refresh only the save button state, not the full page.
+  updateSaveButton();
 }
 
 // Create a default config value from a schema definition
