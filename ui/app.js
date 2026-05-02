@@ -741,6 +741,37 @@ async function saveConfig() {
   }
 }
 
+// Send a project-defined UI action to the backend.
+// Used by dynamic pages for controls that are not configuration changes,
+// such as dashboard buttons or device actions.
+async function sendAction(action, data = {}) {
+  try {
+    if (typeof action !== 'string' || action === '') {
+      return;
+    }
+
+    await api('/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action,
+        data,
+        page: state.page,
+      }),
+    });
+
+    // Refresh the current dynamic page after the action completes so the
+    // dashboard reflects the updated device state immediately.
+    if (state.page !== 'status') {
+      await loadPageData(state.page);
+    }
+
+    render();
+  } catch (error) {
+    alert(String(error.message || error));
+  }
+}
+
 // Start live log stream from HomeKitUI
 function startLogStream() {
   if (logStream !== undefined) {
@@ -1281,6 +1312,7 @@ window.togglePause = togglePause;
 window.clearLogs = clearLogs;
 window.toggleScroll = toggleScroll;
 window.toggleCollapse = toggleCollapse;
+window.sendAction = sendAction;
 window.addSchemaItem = addSchemaItem;
 window.addEventListener('hashchange', async () => {
   let page = window.location.hash.replace('#', '') || 'status';

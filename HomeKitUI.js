@@ -38,6 +38,7 @@
 // - GET  /api/logs/stream
 // - GET  /api/backup
 // - POST /api/restore
+// - POST /api/action
 //
 // Notes:
 // - Designed for HAP-NodeJS standalone environments (not Homebridge)
@@ -81,7 +82,7 @@ const LOG_LEVELS = {
 // Define our HomeKit UI class
 export default class HomeKitUI {
   static DEFAULT_PORT = 8581;
-  static VERSION = '2026.04.30';
+  static VERSION = '2026.05.02';
 
   // Shared console capture state
   static #consoleCaptured = false; // Prevent double-patching console.*
@@ -127,6 +128,7 @@ export default class HomeKitUI {
       onGetPage: undefined,
       onValidateConfig: undefined,
       onSaveConfig: undefined,
+      onAction: undefined,
       onRestoreConfig: undefined,
       onRestart: undefined,
       onResetPairing: undefined,
@@ -181,6 +183,7 @@ export default class HomeKitUI {
     this.#app.get('/api/schema', this.#handleGetSchema.bind(this));
     this.#app.get('/api/ui-schema', this.#handleGetUISchema.bind(this));
     this.#app.get('/api/page/:id', this.#handlePage.bind(this));
+    this.#app.post('/api/action', this.#handleAction.bind(this));
     this.#app.get('/api/homekit', this.#handleHomeKit.bind(this));
     this.#app.post('/api/homekit/reset', this.#handleResetPairing.bind(this));
     this.#app.post('/api/service/restart', this.#handleRestart.bind(this));
@@ -372,6 +375,42 @@ export default class HomeKitUI {
 
       // No handler provided, return empty payload.
       response.json({});
+    } catch (error) {
+      this.#sendError(response, error);
+    }
+  }
+
+  async #handleAction(request, response) {
+    try {
+      // Actions are optional project-defined commands from dynamic pages.
+      // HomeKitUI does not interpret the action itself; it only validates the
+      // payload shape and passes it to the host application.
+      if (request.body === null || typeof request.body !== 'object' || request.body.constructor !== Object) {
+        throw new TypeError('Invalid action supplied');
+      }
+
+      let action = typeof request.body?.action === 'string' && request.body.action !== '' ? request.body.action : undefined;
+      let page = typeof request.body?.page === 'string' && request.body.page !== '' ? request.body.page : undefined;
+      let data =
+        request.body?.data !== undefined && typeof request.body.data === 'object' && request.body.data !== null ? request.body.data : {};
+
+      if (action === undefined) {
+        throw new Error('Invalid action id');
+      }
+
+      if (page !== undefined && this.#hasPage(page) === false) {
+        response.status(404).json({ error: 'Unknown page' });
+        return;
+      }
+
+      if (typeof this.#options.onAction !== 'function') {
+        response.status(501).json({ error: 'Action hook not configured' });
+        return;
+      }
+
+      await this.#options.onAction(action, data, page);
+
+      response.json({ ok: true });
     } catch (error) {
       this.#sendError(response, error);
     }
