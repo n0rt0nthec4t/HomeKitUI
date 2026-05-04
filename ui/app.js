@@ -27,7 +27,7 @@
 // - All UI rendering is handled via DOM updates
 // - Project-specific pages are data-driven or HTML-rendered
 //
-// Code version 2026.05.02
+// Code version 2026.05.03
 // Mark Hulskamp
 
 /* global EventSource, alert, confirm, document, fetch, window */
@@ -750,6 +750,9 @@ async function sendAction(action, data = {}) {
       return;
     }
 
+    // Preserve UI state across the dynamic page refresh.
+    let collapseState = { ...state.collapse };
+
     await api('/api/action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -766,6 +769,7 @@ async function sendAction(action, data = {}) {
       await loadPageData(state.page);
     }
 
+    state.collapse = collapseState;
     render();
   } catch (error) {
     alert(String(error.message || error));
@@ -1044,8 +1048,19 @@ function toggleCollapse(id) {
     return;
   }
 
+  if (state.collapse[id] === undefined) {
+    state.collapse[id] = element.classList.contains('open');
+  }
+
   state.collapse[id] = state.collapse[id] === true ? false : true;
+
   element.classList.toggle('open', state.collapse[id] === true);
+
+  document.querySelectorAll(`[data-collapse="${id}"]`).forEach((button) => {
+    button.classList.toggle('open', state.collapse[id] === true);
+  });
+
+  lastPageRefresh = Date.now();
 }
 
 // Re-apply stored collapse state after a page re-render.
