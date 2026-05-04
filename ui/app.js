@@ -27,10 +27,10 @@
 // - All UI rendering is handled via DOM updates
 // - Project-specific pages are data-driven or HTML-rendered
 //
-// Code version 2026.05.03
+// Code version 2026.05.04
 // Mark Hulskamp
 
-/* global EventSource, alert, confirm, document, fetch, window */
+/* global EventSource, alert, confirm, document, fetch, window, DOMParser */
 'use strict';
 
 // Runtime UI state shared across all render functions
@@ -104,6 +104,12 @@ async function load() {
 // Main render function - builds entire UI shell
 function render() {
   let pages = [...corePages, ...(Array.isArray(state.info.pages) === true ? state.info.pages : [])];
+  let page = (state.info.pages || []).find((item) => item.id === state.page);
+  let style = document.getElementById('project-style');
+
+  if (style !== null && page?.trustedHTML !== true) {
+    style.remove();
+  }
 
   document.getElementById('app').innerHTML = `
     <aside>
@@ -113,7 +119,7 @@ function render() {
             <button
               class="${state.page === page.id ? 'active' : ''}"
               title="${escapeHTML(page.title)}"
-              onclick="setPage('${escapeHTML(page.id)}')"
+              data-page="${escapeHTML(page.id)}"
             >
               ${icon(page)}
             </button>
@@ -450,7 +456,7 @@ function statusPage() {
       </div>
 
       <div class="page-actions">
-        <button title="Restart Service" onclick="restartService()">
+        <button title="Restart Service" data-action="restartService">
           ${restartIcon()}
         </button>
 
@@ -491,7 +497,11 @@ function pairingCard(accessory = state.homekit) {
             <button
               class="pairing-state ${accessory.paired === true ? 'paired' : 'unpaired'}"
               title="${accessory.paired === true ? 'Reset HomeKit Pairing' : 'Not Paired'}"
-              onclick="${accessory.paired === true ? `resetPairing('${escapeHTML(accessory.username || '')}')` : ''}"
+              ${
+                accessory.paired === true
+                  ? `data-action="resetPairing" data-username="${escapeHTML(accessory.username || '')}"`
+                  : 'disabled'
+              }
               data-dynamic="pairing"
             >
               ${linkIcon()}
@@ -513,9 +523,13 @@ function logsCard() {
         <div class="logs-title">Log</div>
 
         <div class="logs-controls">
-          <button id="logs-pause" title="Pause logs" onclick="togglePause()">${logsPaused === true ? 'Live' : 'Pause'}</button>
-          <button title="Clear logs" onclick="clearLogs()">Clear</button>
-          <button id="logs-scroll" title="Toggle auto-scroll" onclick="toggleScroll()">${logsAutoScroll === true ? 'Scroll' : 'Manual'}</button>
+          <button id="logs-pause" title="Pause logs" data-action="togglePause">
+            ${logsPaused === true ? 'Live' : 'Pause'}
+          </button>
+          <button title="Clear logs" data-action="clearLogs">Clear</button>
+          <button id="logs-scroll" title="Toggle auto-scroll" data-action="toggleScroll">
+            ${logsAutoScroll === true ? 'Scroll' : 'Manual'}
+          </button>
         </div>
       </div>
 
@@ -525,8 +539,8 @@ function logsCard() {
 }
 
 // Project-specific page renderer.
-// HomeKitUI remains generic by rendering host-provided HTML, list data,
-// or schema-backed config sections.
+// HomeKitUI remains generic by rendering trusted host-provided HTML,
+// list data, or schema-backed config sections.
 function projectPage() {
   // Find the active page definition
   let page = (state.info.pages || []).find((item) => item.id === state.page);
@@ -537,11 +551,25 @@ function projectPage() {
 
   let data = state.pageData[page.id];
 
-  // HTML page (fully rendered by backend)
-  if (data !== undefined && data !== null && data.type === 'html' && typeof data.html === 'string') {
+  // HTML page (fully rendered by trusted backend)
+  if (page.trustedHTML === true && data !== undefined && data !== null && data.type === 'html' && typeof data.html === 'string') {
+    // Inject CSS once (or update it if changed)
+    if (typeof data.css === 'string' && data.css !== '') {
+      let style = document.getElementById('project-style');
+
+      if (style === null) {
+        style = document.createElement('style');
+        style.id = 'project-style';
+        document.head.appendChild(style);
+      }
+
+      if (style.textContent !== data.css) {
+        style.textContent = data.css;
+      }
+    }
+
     return `
       <h1>${escapeHTML(page.title)}</h1>
-      ${typeof data.css === 'string' && data.css !== '' ? `<style>${data.css}</style>` : ''}
       ${data.html}
     `;
   }
@@ -590,7 +618,7 @@ function renderConfigPage(page) {
     let schema = getSchemaAtPath(page.schemaPath);
 
     if (schema?.type === 'array' && schema?.items?.type === 'object') {
-      addButton = `<button class="secondary" onclick="addSchemaItem('${escapeHTML(page.schemaPath)}')">+ Add</button>`;
+      addButton = `<button class="secondary" data-action="addSchemaItem" data-path="${escapeHTML(page.schemaPath)}">+ Add</button>`;
     }
   }
 
@@ -606,7 +634,7 @@ function renderConfigPage(page) {
             id="save-config"
             class="${hasChanges === true ? 'primary' : 'secondary'}"
             ${hasChanges === true ? '' : 'disabled'}
-            onclick="saveConfig()"
+            data-action="saveConfig"
           >
             ${hasChanges === true ? 'Save Changes' : 'No Changes'}
           </button>
@@ -853,9 +881,10 @@ function appendLog(entry) {
   }
 
   let div = document.createElement('div');
+  let html = typeof entry.html === 'string' && entry.html.includes('<span') === true ? entry.html : escapeHTML(entry.message || '');
 
   div.className = 'log-line log-' + escapeClassName(entry.level || 'info');
-  div.innerHTML = typeof entry.html === 'string' ? entry.html : escapeHTML(entry.message || '');
+  div.innerHTML = html;
 
   logs.appendChild(div);
 
@@ -888,8 +917,8 @@ function renderLogsOnly(scroll = true) {
       // Restrict level to safe class-name characters.
       let level = escapeClassName(entry.level || 'info');
 
-      // Prefer pre-rendered HTML from backend, otherwise escape plain text.
-      let html = typeof entry.html === 'string' ? entry.html : escapeHTML(entry.message || '');
+      // Prefer ANSI-rendered HTML from backend, otherwise escape plain text.
+      let html = typeof entry.html === 'string' && entry.html.includes('<span') === true ? entry.html : escapeHTML(entry.message || '');
 
       return '<div class="log-line log-' + level + '">' + html + '</div>';
     })
@@ -1056,7 +1085,7 @@ function toggleCollapse(id) {
 
   element.classList.toggle('open', state.collapse[id] === true);
 
-  document.querySelectorAll(`[data-collapse="${id}"]`).forEach((button) => {
+  document.querySelectorAll(`[data-target="${id}"]`).forEach((button) => {
     button.classList.toggle('open', state.collapse[id] === true);
   });
 
@@ -1078,8 +1107,8 @@ function restoreCollapseState() {
       element.classList.toggle('open', isOpen);
     }
 
-    // Restore ALL matching toggle buttons
-    let buttons = document.querySelectorAll(`[data-collapse="${id}"]`);
+    // Restore matching toggle buttons
+    let buttons = document.querySelectorAll(`[data-target="${id}"]`);
     buttons.forEach((btn) => btn.classList.toggle('open', isOpen));
   });
 }
@@ -1258,8 +1287,37 @@ function getSchemaAtPath(schemaPath) {
 
 // Icon mapping
 function icon(page) {
-  if (typeof page?.svg === 'string' && page.svg.trim() !== '' && page.svg.includes('<svg') === true) {
-    return page.svg;
+  if (typeof page?.svg === 'string' && page.svg.length <= 5000 && page.svg.trim() !== '' && page.svg.includes('<svg') === true) {
+    try {
+      let parser = new DOMParser();
+      let doc = parser.parseFromString(page.svg, 'image/svg+xml');
+      let root = doc.querySelector('svg');
+
+      if (root !== null && doc.querySelector('parsererror') === null) {
+        // Remove dangerous elements
+        root.querySelectorAll('script, foreignObject, iframe, object, embed, link, style').forEach((el) => el.remove());
+
+        // Strip unsafe attributes
+        root.querySelectorAll('*').forEach((el) => {
+          [...el.attributes].forEach((attr) => {
+            let name = attr.name.toLowerCase();
+            let value = attr.value.trim().toLowerCase();
+
+            if (name.startsWith('on') === true) {
+              el.removeAttribute(attr.name);
+            }
+
+            if ((name === 'href' || name === 'xlink:href') && value.startsWith('javascript:') === true) {
+              el.removeAttribute(attr.name);
+            }
+          });
+        });
+
+        return root.outerHTML;
+      }
+    } catch {
+      // fall through to default
+    }
   }
 
   let icons = {
@@ -1329,6 +1387,106 @@ window.toggleScroll = toggleScroll;
 window.toggleCollapse = toggleCollapse;
 window.sendAction = sendAction;
 window.addSchemaItem = addSchemaItem;
+// Global click handler using event delegation.
+// Handles:
+// - Page navigation (data-page)
+// - Backend-driven actions (data-send-action)
+// - Built-in UI actions (data-action)
+document.addEventListener('click', async (event) => {
+  // Page navigation (sidebar)
+  //
+  // Buttons declare: data-page="..."
+  // Example: <button data-page="status">
+  let pageButton = event.target.closest('[data-page]');
+
+  if (pageButton !== null) {
+    await setPage(pageButton.dataset.page);
+    return;
+  }
+
+  // Backend-defined actions (custom dashboards)
+  //
+  // Buttons declare:
+  // - data-send-action="actionName"
+  // - data-payload='{"key":"value"}'
+  //
+  // This allows backend HTML to trigger actions without inline JS.
+  let sendActionButton = event.target.closest('[data-send-action]');
+
+  if (sendActionButton !== null) {
+    let data = {};
+
+    // Safely parse payload JSON
+    try {
+      data = JSON.parse(sendActionButton.dataset.payload || '{}');
+    } catch {
+      data = {};
+    }
+
+    // Dispatch action to backend
+    await sendAction(sendActionButton.dataset.sendAction, data);
+    return;
+  }
+
+  // Built-in UI actions
+  //
+  // Buttons declare: data-action="..."
+  // Used for core UI features (logs, config, restart, etc.)
+  let actionButton = event.target.closest('[data-action]');
+
+  if (actionButton !== null) {
+    let action = actionButton.dataset.action;
+
+    // Restart service (backend call)
+    if (action === 'restartService') {
+      await restartService();
+      return;
+    }
+
+    // Reset HomeKit pairing for selected accessory
+    if (action === 'resetPairing') {
+      await resetPairing(actionButton.dataset.username);
+      return;
+    }
+
+    // Clear log buffer (frontend only)
+    if (action === 'clearLogs') {
+      clearLogs();
+      return;
+    }
+
+    // Pause/resume live logs
+    if (action === 'togglePause') {
+      togglePause();
+      return;
+    }
+
+    // Toggle auto-scroll behaviour
+    if (action === 'toggleScroll') {
+      toggleScroll();
+      return;
+    }
+
+    // Save configuration (backend call)
+    if (action === 'saveConfig') {
+      await saveConfig();
+      return;
+    }
+
+    // Add item to schema array
+    if (action === 'addSchemaItem') {
+      addSchemaItem(actionButton.dataset.path);
+      return;
+    }
+
+    // Collapse/expand UI sections
+    if (action === 'toggleCollapse') {
+      toggleCollapse(actionButton.dataset.target);
+      return;
+    }
+  }
+});
+
 window.addEventListener('hashchange', async () => {
   let page = window.location.hash.replace('#', '') || 'status';
   let exists = (state.info.pages || []).some((p) => p.id === page) || page === 'status';

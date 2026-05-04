@@ -82,7 +82,7 @@ const LOG_LEVELS = {
 // Define our HomeKit UI class
 export default class HomeKitUI {
   static DEFAULT_PORT = 8581;
-  static VERSION = '2026.05.02';
+  static VERSION = '2026.05.04';
 
   // Shared console capture state
   static #consoleCaptured = false; // Prevent double-patching console.*
@@ -301,9 +301,9 @@ export default class HomeKitUI {
         await this.#writeJsonFile(this.#options.configFile, request.body);
       }
 
-      // Most config changes require the standalone process to restart so HAP and
-      // hardware resources are rebuilt cleanly.
-      response.json({ ok: true, restartRequired: true });
+      // Restart requirement is evaluated by the frontend using changed paths and
+      // schema/page metadata. Restore/reset endpoints still force restart where needed.
+      response.json({ ok: true });
     } catch (error) {
       this.#sendError(response, error);
     }
@@ -537,15 +537,28 @@ export default class HomeKitUI {
       this.#streamCommand(response, 'journalctl', [...(await this.#journalArgs(0)), '-f']);
     } else {
       // Console stream is the last fallback for direct/manual runs.
+      let closed = false;
+
+      let cleanup = () => {
+        if (closed === true) {
+          return;
+        }
+
+        closed = true;
+        HomeKitUI.#consoleListeners.delete(listener);
+        this.#logListeners.delete(response);
+      };
+
       let listener = (entry) => {
-        response.write('data: ' + JSON.stringify(this.#logEntry(entry.terminal, entry.level, entry.time)) + '\n\n');
+        try {
+          response.write('data: ' + JSON.stringify(this.#logEntry(entry.terminal, entry.level, entry.time)) + '\n\n');
+        } catch {
+          cleanup();
+        }
       };
 
       HomeKitUI.#consoleListeners.add(listener);
-
-      this.#logListeners.set(response, () => {
-        HomeKitUI.#consoleListeners.delete(listener);
-      });
+      this.#logListeners.set(response, cleanup);
     }
 
     // Remove closed clients so we don't leak response handles, child processes, or listeners.
@@ -555,8 +568,6 @@ export default class HomeKitUI {
       if (typeof cleanup === 'function') {
         cleanup();
       }
-
-      this.#logListeners.delete(response);
     });
   }
 
@@ -862,10 +873,25 @@ export default class HomeKitUI {
     // Stream a child process line-by-line into SSE. Used by both tail and journalctl.
     let buffer = '';
     let proc = spawn(command, args);
+    let closed = false;
 
     let cleanup = () => {
+      if (closed === true) {
+        return;
+      }
+
+      closed = true;
+      this.#logListeners.delete(response);
+
       try {
         proc.kill('SIGTERM');
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
+
+      try {
+        response.end();
         // eslint-disable-next-line no-unused-vars
       } catch (error) {
         // Empty
@@ -882,14 +908,17 @@ export default class HomeKitUI {
 
       lines.forEach((line) => {
         if (line.trim() !== '') {
-          response.write('data: ' + JSON.stringify(this.#logEntry(line)) + '\n\n');
+          try {
+            response.write('data: ' + JSON.stringify(this.#logEntry(line)) + '\n\n');
+          } catch {
+            cleanup();
+          }
         }
       });
     });
 
-    proc.on('error', () => {
-      cleanup();
-    });
+    proc.on('error', cleanup);
+    proc.on('close', cleanup);
   }
 
   #logEntry(line, level = LOG_LEVELS.INFO, time = new Date().toISOString()) {
@@ -949,11 +978,18 @@ export default class HomeKitUI {
         title: typeof page.title === 'string' && page.title !== '' ? page.title : undefined,
         icon: typeof page.icon === 'string' && page.icon !== '' ? page.icon : undefined,
         svg: typeof page.svg === 'string' && page.svg !== '' ? page.svg : undefined,
-        schemaPath: typeof page.schemaPath === 'string' && page.schemaPath !== '' ? page.schemaPath : undefined,
+        schemaPath:
+          typeof page.schemaPath === 'string' &&
+          page.schemaPath !== '' &&
+          /^[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*$/.test(page.schemaPath) === true
+            ? page.schemaPath
+            : undefined,
+        restartRequired: page.restartRequired === true ? true : page.restartRequired === false ? false : undefined,
         refreshInterval:
           Number.isFinite(Number(page.refreshInterval)) === true && Number(page.refreshInterval) > 0
             ? Number(page.refreshInterval)
             : undefined,
+        trustedHTML: page.trustedHTML === true ? true : undefined,
       }))
       .filter((page) => page.id !== undefined && page.title !== undefined);
   }
