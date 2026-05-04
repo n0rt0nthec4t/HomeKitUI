@@ -40,6 +40,8 @@ aside {
 }
 
 aside button {
+  min-width: 52px;
+  min-height: 46px;
   width: 52px;
   height: 46px;
   border: 0;
@@ -50,6 +52,7 @@ aside button {
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
 }
 
 aside button:hover {
@@ -104,7 +107,7 @@ aside button .icon-dot {
 }
 
 .page-meta {
-  margin-top: 6px;
+  margin-top: 4px;
   font-size: 13px;
   color: var(--muted);
 }
@@ -224,10 +227,8 @@ h1 {
   font-size: 20px;
   font-weight: 700;
   text-align: center;
-}
-
-.pin:hover {
-  color: var(--accent);
+  cursor: default;
+  user-select: none;
 }
 
 .pairing-status {

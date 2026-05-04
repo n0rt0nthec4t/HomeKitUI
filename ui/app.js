@@ -119,6 +119,7 @@ function render() {
             <button
               class="${state.page === page.id ? 'active' : ''}"
               title="${escapeHTML(page.title)}"
+              aria-label="${escapeHTML(page.title)}"
               data-page="${escapeHTML(page.id)}"
             >
               ${icon(page)}
@@ -446,7 +447,7 @@ function statusPage() {
   return `
     <div class="page-header">
       <div>
-        <h1>HomeKit Status</h1>
+        <h1>Status</h1>
         <div class="page-meta">
           App v${escapeHTML(state.info.version || '')} •
           UI v${escapeHTML(state.info.uiVersion || '')} •
