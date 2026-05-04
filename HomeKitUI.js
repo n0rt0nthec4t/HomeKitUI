@@ -85,6 +85,7 @@ export default class HomeKitUI {
   static VERSION = '2026.05.04';
 
   // Shared console capture state
+  static DEFAULT_CONSOLE_HISTORY_LINES = 500;
   static #consoleCaptured = false; // Prevent double-patching console.*
   static #consoleHistory = []; // Recent console output for non-systemd/direct runs
   static #consoleListeners = new Set(); // Live console listeners for SSE clients
@@ -954,7 +955,7 @@ export default class HomeKitUI {
       lines:
         Number.isFinite(Number(this.#options.logs.lines)) === true && Number(this.#options.logs.lines) > 0
           ? Number(this.#options.logs.lines)
-          : 500,
+          : HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES,
     };
   }
 
@@ -1015,14 +1016,23 @@ export default class HomeKitUI {
     }
   }
 
-  static #captureConsole(lines = 500) {
+  static #captureConsole(lines = HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES) {
     // Patch console once so direct/manual runs still have a live log source when
     // journald and file logs are unavailable.
     if (HomeKitUI.#consoleCaptured === true) {
       return;
     }
 
+    // Ensure lines is a valid positive integer. Fallback to default if invalid.
+    lines =
+      Number.isFinite(Number(lines)) === true && Number(lines) > 0
+        ? Number(lines)
+        : HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES;
+
     HomeKitUI.#consoleCaptured = true;
+
+    // Preserve original console methods so we can still output to stdout/stderr
+    // after intercepting log calls.
     HomeKitUI.#consoleOriginal.log = console.log;
     HomeKitUI.#consoleOriginal.info = console.info;
     HomeKitUI.#consoleOriginal.warn = console.warn;
@@ -1037,28 +1047,39 @@ export default class HomeKitUI {
       ['debug', LOG_LEVELS.DEBUG],
     ].forEach(([method, level]) => {
       console[method] = (...args) => {
+        // Format console arguments into a single string using Node.js util.format
         let line = util.format(...args);
+
+        // Construct a log entry that can be consumed by the UI or streamed via SSE
         let entry = {
           time: new Date().toISOString(),
           level,
           message: line,
-          terminal: line,
+          terminal: line, // Preserve raw terminal output for streaming
         };
 
+        // Append to in-memory history buffer
         HomeKitUI.#consoleHistory.push(entry);
 
-        while (HomeKitUI.#consoleHistory.length > lines) {
-          HomeKitUI.#consoleHistory.shift();
+        // Trim history buffer to configured size using splice (O(n)),
+        // replacing the previous shift() loop (O(n²) under heavy load)
+        if (HomeKitUI.#consoleHistory.length > lines) {
+          HomeKitUI.#consoleHistory.splice(
+            0,
+            HomeKitUI.#consoleHistory.length - lines,
+          );
         }
 
+        // Notify active listeners (e.g. SSE log stream clients)
         HomeKitUI.#consoleListeners.forEach((listener) => {
           try {
             listener(entry);
           } catch {
-            // Empty
+            // Ignore listener errors to avoid breaking logging
           }
         });
 
+        // Forward the original console call so logs still appear normally
         HomeKitUI.#consoleOriginal[method](...args);
       };
     });

@@ -161,6 +161,12 @@ function renderSchemaMount() {
     return;
   }
 
+  // schemaPath is already sanitised by the backend, but validate again before
+  // resolving nested objects in the frontend.
+  if (/^[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*$/.test(page.schemaPath) !== true) {
+    return;
+  }
+
   // Pull both the current config value and its matching schema section from
   // the configured schema path, then render the generic schema form.
   let value = getSchemaPathValue(page.schemaPath);
