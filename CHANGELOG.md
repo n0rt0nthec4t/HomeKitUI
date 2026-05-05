@@ -2,6 +2,20 @@
 
 All notable changes to the `HomeKitUI` module are documented in this file.
 
+# 2026/05/05
+
+### Added
+- Added generic `switchVisible` frontend action for switching visible UI sections without inline JavaScript
+- Added persistent visible state tracking using `localStorage`
+- Added persistent collapse state tracking using `localStorage`
+- Added batched render scheduling to reduce unnecessary full UI re-renders
+
+### Changed
+- Improved dynamic page refresh handling to avoid re-rendering while form controls are active
+- Updated backend action refresh flow to preserve collapse and visible UI state
+- Improved dashboard state restoration after refreshes and dynamic page updates
+- Refined runtime render flow to reduce timer/UI interaction races
+
 ## 2026/05/04
 
 ### Added

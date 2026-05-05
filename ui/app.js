@@ -27,7 +27,7 @@
 // - All UI rendering is handled via DOM updates
 // - Project-specific pages are data-driven or HTML-rendered
 //
-// Code version 2026.05.04
+// Code version 2026.05.05
 // Mark Hulskamp
 
 /* global EventSource, alert, confirm, document, fetch, window, DOMParser */
@@ -43,6 +43,7 @@ let state = {
   uiSchema: {},
   pageData: {},
   collapse: {},
+  visible: {},
   logs: [],
   error: undefined,
   changedPaths: new Set(),
@@ -59,6 +60,8 @@ let runtimeTimer = undefined;
 let lastStatusPoll = 0;
 let lastPageRefresh = 0;
 let logScrollTop = 0;
+let renderTimer = undefined;
+let renderPending = false;
 
 // Simple API wrapper with error handling
 async function api(apiPath, options = {}) {
@@ -101,6 +104,28 @@ async function load() {
   startLogStream();
 }
 
+// Schedule a single render on the next browser tick.
+// This allows multiple state changes in the same event loop to collapse into
+// one render() call and avoids timers competing with UI actions.
+function scheduleRender() {
+  renderPending = true;
+
+  if (renderTimer !== undefined) {
+    return;
+  }
+
+  renderTimer = window.setTimeout(() => {
+    renderTimer = undefined;
+
+    if (renderPending !== true) {
+      return;
+    }
+
+    renderPending = false;
+    render();
+  }, 0);
+}
+
 // Main render function - builds entire UI shell
 function render() {
   let pages = [...corePages, ...(Array.isArray(state.info.pages) === true ? state.info.pages : [])];
@@ -139,6 +164,7 @@ function render() {
   renderLogsOnly(true);
   renderSchemaMount();
   restoreCollapseState();
+  restoreVisibleState();
 }
 
 // Render schema-backed form content into the current page after the main
@@ -787,6 +813,7 @@ async function sendAction(action, data = {}) {
 
     // Preserve UI state across the dynamic page refresh.
     let collapseState = { ...state.collapse };
+    let visibleState = { ...state.visible };
 
     await api('/api/action', {
       method: 'POST',
@@ -805,7 +832,8 @@ async function sendAction(action, data = {}) {
     }
 
     state.collapse = collapseState;
-    render();
+    state.visible = visibleState;
+    scheduleRender();
   } catch (error) {
     alert(String(error.message || error));
   }
@@ -982,7 +1010,7 @@ function startRuntimeTimer() {
           state.homekit = latestHomeKit;
 
           if (state.page === 'status') {
-            render();
+            scheduleRender();
           }
         }
         // eslint-disable-next-line no-unused-vars
@@ -992,10 +1020,21 @@ function startRuntimeTimer() {
     }
 
     // Refresh dynamic project pages that request periodic updates.
+    // Do not refresh while the user is interacting with a form/control,
+    // otherwise the page can re-render while a select/dropdown is open.
     let page = (state.info.pages || []).find((item) => item.id === state.page);
     let refreshInterval = Number(page?.refreshInterval);
+    let activeElement = document.activeElement;
+    let uiControlActive =
+      activeElement !== null &&
+      (activeElement.tagName === 'SELECT' ||
+        activeElement.tagName === 'INPUT' ||
+        activeElement.tagName === 'TEXTAREA' ||
+        activeElement.tagName === 'BUTTON' ||
+        activeElement.closest('[data-action]') !== null);
 
     if (
+      uiControlActive !== true &&
       state.page !== 'status' &&
       page?.schemaPath === undefined &&
       Number.isFinite(refreshInterval) === true &&
@@ -1005,7 +1044,7 @@ function startRuntimeTimer() {
       lastPageRefresh = now;
 
       await loadPageData(page.id);
-      render();
+      scheduleRender();
     }
   }, 1000);
 }
@@ -1076,7 +1115,7 @@ function toggleScroll() {
 }
 
 // Toggle a project-provided collapsible section.
-// Open state is stored so dynamic page refreshes can re-apply it after render().
+// Open state is stored so dynamic page refreshes and browser refreshes can re-apply it.
 function toggleCollapse(id) {
   let element = document.getElementById(id);
 
@@ -1084,11 +1123,14 @@ function toggleCollapse(id) {
     return;
   }
 
+  let storageKey = 'homekitui-collapse-' + state.page + '-' + id;
+
   if (state.collapse[id] === undefined) {
     state.collapse[id] = element.classList.contains('open');
   }
 
   state.collapse[id] = state.collapse[id] === true ? false : true;
+  window.localStorage.setItem(storageKey, state.collapse[id] === true ? 'true' : 'false');
 
   element.classList.toggle('open', state.collapse[id] === true);
 
@@ -1101,22 +1143,89 @@ function toggleCollapse(id) {
 
 // Re-apply stored collapse state after a page re-render.
 function restoreCollapseState() {
-  if (typeof state.collapse !== 'object') {
+  if (typeof state.collapse !== 'object' || state.collapse === null) {
     return;
   }
 
-  Object.keys(state.collapse).forEach((id) => {
-    let isOpen = state.collapse[id] === true;
-
-    // Restore panel
-    let element = document.getElementById(id);
-    if (element !== null) {
-      element.classList.toggle('open', isOpen);
+  document.querySelectorAll('.dashboard-collapse').forEach((element) => {
+    if (typeof element.id !== 'string' || element.id === '') {
+      return;
     }
 
+    let storageKey = 'homekitui-collapse-' + state.page + '-' + element.id;
+    let storedValue = window.localStorage.getItem(storageKey);
+
+    if (storedValue !== null) {
+      state.collapse[element.id] = storedValue === 'true';
+    }
+
+    let isOpen = state.collapse[element.id] === true;
+
+    // Restore panel
+    element.classList.toggle('open', isOpen);
+
     // Restore matching toggle buttons
-    let buttons = document.querySelectorAll(`[data-target="${id}"]`);
-    buttons.forEach((btn) => btn.classList.toggle('open', isOpen));
+    document.querySelectorAll(`[data-target="${element.id}"]`).forEach((button) => {
+      button.classList.toggle('open', isOpen);
+    });
+  });
+}
+
+// Apply visible-switch state for one control.
+// Used by trusted project pages for simple frontend-only view switching.
+function applyVisibleState(control, value, persist = false) {
+  if (control === null || control === undefined) {
+    return;
+  }
+
+  let group = control.dataset.targetGroup;
+
+  if (typeof group !== 'string' || group === '') {
+    return;
+  }
+
+  let selectedValue = String(value ?? control.value);
+  let storageKey = 'homekitui-visible-' + state.page + '-' + group;
+
+  state.visible[group] = selectedValue;
+  control.value = selectedValue;
+
+  if (persist === true) {
+    window.localStorage.setItem(storageKey, selectedValue);
+  }
+
+  let root = control.closest('[data-visible-root]') || document;
+
+  root.querySelectorAll('[data-visible-group="' + group + '"]').forEach((item) => {
+    item.hidden = item.dataset.visibleValue !== selectedValue;
+  });
+}
+
+// Re-apply stored generic visible-switch state after a page re-render.
+function restoreVisibleState() {
+  if (typeof state.visible !== 'object' || state.visible === null) {
+    return;
+  }
+
+  document.querySelectorAll('[data-action="switchVisible"]').forEach((control) => {
+    let group = control.dataset.targetGroup;
+
+    if (typeof group !== 'string' || group === '') {
+      return;
+    }
+
+    let storageKey = 'homekitui-visible-' + state.page + '-' + group;
+    let value = state.visible[group];
+
+    if (value === undefined) {
+      value = window.localStorage.getItem(storageKey);
+    }
+
+    if (value === null || value === undefined) {
+      value = control.value;
+    }
+
+    applyVisibleState(control, value, false);
   });
 }
 
@@ -1383,6 +1492,7 @@ function downloadIcon() {
 }
 
 // Expose functions globally for inline onclick handlers
+window.scheduleRender = scheduleRender;
 window.setPage = setPage;
 window.restartService = restartService;
 window.resetPairing = resetPairing;
@@ -1492,6 +1602,18 @@ document.addEventListener('click', async (event) => {
       return;
     }
   }
+});
+
+// Global change handler using event delegation.
+// Handles generic frontend-only UI changes without inline JavaScript.
+document.addEventListener('change', (event) => {
+  let control = event.target.closest('[data-action="switchVisible"]');
+
+  if (control === null) {
+    return;
+  }
+
+  applyVisibleState(control, control.value, true);
 });
 
 window.addEventListener('hashchange', async () => {

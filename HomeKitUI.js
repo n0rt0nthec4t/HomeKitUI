@@ -1024,10 +1024,7 @@ export default class HomeKitUI {
     }
 
     // Ensure lines is a valid positive integer. Fallback to default if invalid.
-    lines =
-      Number.isFinite(Number(lines)) === true && Number(lines) > 0
-        ? Number(lines)
-        : HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES;
+    lines = Number.isFinite(Number(lines)) === true && Number(lines) > 0 ? Number(lines) : HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES;
 
     HomeKitUI.#consoleCaptured = true;
 
@@ -1064,10 +1061,7 @@ export default class HomeKitUI {
         // Trim history buffer to configured size using splice (O(n)),
         // replacing the previous shift() loop (O(n²) under heavy load)
         if (HomeKitUI.#consoleHistory.length > lines) {
-          HomeKitUI.#consoleHistory.splice(
-            0,
-            HomeKitUI.#consoleHistory.length - lines,
-          );
+          HomeKitUI.#consoleHistory.splice(0, HomeKitUI.#consoleHistory.length - lines);
         }
 
         // Notify active listeners (e.g. SSE log stream clients)
