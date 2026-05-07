@@ -548,18 +548,18 @@ export default class HomeKitUI {
         return;
       }
 
-      // Send success response before triggering restart. Some restart handlers may
-      // terminate the HTTP server or exit the process immediately, so waiting for
-      // the hook before responding can leave the browser with a failed request.
-      response.json({ ok: true, restartRequired: true });
-
-      // Wait until the HTTP response has fully flushed before invoking restart.
-      // This avoids terminating the process before the client receives confirmation.
-      response.on('finish', () => {
+      // Register the finish handler BEFORE sending the response so we cannot miss
+      // the event if Express flushes the response immediately.
+      response.once('finish', () => {
         this.#options.onRestart().catch((error) => {
           this.#log(LOG_LEVELS.ERROR, String(error?.stack ?? error));
         });
       });
+
+      // Send success response before triggering restart. Some restart handlers may
+      // terminate the HTTP server or exit the process immediately, so waiting for
+      // the hook before responding can leave the browser with a failed request.
+      response.json({ ok: true, restartRequired: true });
     } catch (error) {
       this.#sendError(response, error);
     }
