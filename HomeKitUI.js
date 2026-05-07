@@ -126,7 +126,7 @@ export default class HomeKitUI {
       name: 'HomeKit Device',
       version: HomeKitUI.VERSION,
       port: HomeKitUI.DEFAULT_PORT,
-      host: undefined,
+      host: '127.0.0.1',
       auth: {},
       configFile: undefined,
       schemaFile: undefined,
@@ -215,10 +215,9 @@ export default class HomeKitUI {
       response.sendFile(path.join(STATIC_PATH, 'index.html'));
     });
 
-    // Start listening on either a specific host or Express' default binding.
-    // Leaving host undefined preserves backwards-compatible LAN access for
-    // existing standalone apps, while allowing host apps to explicitly bind
-    // to localhost or another interface when desired.
+    // Start listening on either a specific host or localhost by default.
+    // HomeKitUI now defaults to loopback-only binding for safer standalone
+    // deployments unless the host application explicitly exposes another interface.
     await new Promise((resolve) => {
       if (typeof this.#options.host === 'string' && this.#options.host !== '') {
         this.#server = this.#app.listen(this.#options.port, this.#options.host, resolve);
@@ -230,9 +229,10 @@ export default class HomeKitUI {
     this.#log(LOG_LEVELS.SUCCESS, 'Setup HomeKitUI for "%s"', this.#options.name);
     this.#log(
       LOG_LEVELS.INFO,
-      '  += Listening on "%s:%s"',
-      typeof this.#options.host === 'string' && this.#options.host !== '' ? this.#options.host : 'default',
+      '  += Listening on "%s:%s"%s',
+      typeof this.#options.host === 'string' && this.#options.host !== '' ? this.#options.host : 'localhost',
       this.#options.port,
+      this.#options.auth.enabled === true ? ' (authentication enabled)' : '',
     );
     this.#sanitisePages(this.#options.pages).forEach((page) => {
       this.#log(LOG_LEVELS.DEBUG, '  += Added page "%s"', page.title);
