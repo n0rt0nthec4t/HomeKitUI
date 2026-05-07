@@ -16,6 +16,7 @@
 // - Stream logs from a file, journald or console capture
 // - Support resetting HomeKit pairing data via HAP-NodeJS cleanup
 // - Provide optional hooks for restart and maintenance actions
+// - Provide optional bearer-token authentication for API/UI access
 //
 // Architecture:
 // - Intended to be used alongside HomeKitDevice-based projects
@@ -23,6 +24,7 @@
 // - HomeKitUI owns the application shell, status page, logs, and maintenance pages
 // - Host projects provide configuration schema, optional pages, and page data hooks
 // - UI communicates with the host application via API endpoints and hooks
+// - Authentication is handled centrally via Express middleware before route handling
 //
 // API Endpoints:
 // - GET  /api/info
@@ -40,6 +42,14 @@
 // - POST /api/restore
 // - POST /api/action
 //
+// Authentication:
+// - Optional bearer-token authentication for all API endpoints
+// - Uses standard HTTP Authorization: Bearer <token> header
+// - SSE log streaming supports token query parameter fallback because
+//   native browser EventSource does not support custom headers
+// - Authentication tokens are supplied by the host application
+// - Host application remains responsible for token generation/persistence
+//
 // Notes:
 // - Designed for HAP-NodeJS standalone environments (not Homebridge)
 // - Does not manage accessory lifecycle or publishing directly
@@ -49,6 +59,7 @@
 // - Journald is preferred in auto mode when running under systemd
 // - Console capture is used as fallback for direct/manual runs
 // - Built-in UI is always served from this module's ui folder
+// - Default host binding follows Express behaviour unless explicitly configured
 //
 // Mark Hulskamp
 'use strict';
@@ -82,7 +93,7 @@ const LOG_LEVELS = {
 // Define our HomeKit UI class
 export default class HomeKitUI {
   static DEFAULT_PORT = 8581;
-  static VERSION = '2026.05.04';
+  static VERSION = '2026.05.07';
 
   // Shared console capture state
   static DEFAULT_CONSOLE_HISTORY_LINES = 500;
@@ -116,6 +127,7 @@ export default class HomeKitUI {
       version: HomeKitUI.VERSION,
       port: HomeKitUI.DEFAULT_PORT,
       host: undefined,
+      auth: {},
       configFile: undefined,
       schemaFile: undefined,
       uiSchemaFile: undefined,
@@ -178,6 +190,7 @@ export default class HomeKitUI {
 
     // Register core API routes. Keep routes flat and explicit so the built-in UI can
     // remain simple and the host app has a predictable API contract.
+    this.#app.use('/api', this.#handleAuthentication.bind(this));
     this.#app.get('/api/info', this.#handleInfo.bind(this));
     this.#app.get('/api/config', this.#handleGetConfig.bind(this));
     this.#app.post('/api/config', this.#handleSaveConfig.bind(this));
@@ -202,8 +215,10 @@ export default class HomeKitUI {
       response.sendFile(path.join(STATIC_PATH, 'index.html'));
     });
 
-    // Start listening on either a specific host or all interfaces. Host is optional
-    // so simple apps can just bind to the default network behaviour.
+    // Start listening on either a specific host or Express' default binding.
+    // Leaving host undefined preserves backwards-compatible LAN access for
+    // existing standalone apps, while allowing host apps to explicitly bind
+    // to localhost or another interface when desired.
     await new Promise((resolve) => {
       if (typeof this.#options.host === 'string' && this.#options.host !== '') {
         this.#server = this.#app.listen(this.#options.port, this.#options.host, resolve);
@@ -213,7 +228,12 @@ export default class HomeKitUI {
     });
 
     this.#log(LOG_LEVELS.SUCCESS, 'Setup HomeKitUI for "%s"', this.#options.name);
-    this.#log(LOG_LEVELS.INFO, '  += Listening on port "%s"', this.#options.port);
+    this.#log(
+      LOG_LEVELS.INFO,
+      '  += Listening on "%s:%s"',
+      typeof this.#options.host === 'string' && this.#options.host !== '' ? this.#options.host : 'default',
+      this.#options.port,
+    );
     this.#sanitisePages(this.#options.pages).forEach((page) => {
       this.#log(LOG_LEVELS.DEBUG, '  += Added page "%s"', page.title);
     });
@@ -254,6 +274,51 @@ export default class HomeKitUI {
     this.#server = undefined;
     this.#app = undefined;
     return true;
+  }
+
+  #handleAuthentication(request, response, next) {
+    // Authentication is optional so existing standalone applications can continue
+    // operating exactly as before unless bearer-token protection is explicitly enabled.
+    if (this.#options.auth.enabled !== true) {
+      next();
+      return;
+    }
+
+    let token = undefined;
+
+    // Prefer standard HTTP Authorization header using Bearer authentication.
+    // This keeps API access compatible with curl, reverse proxies, and scripts.
+    let authHeader = typeof request.headers?.authorization === 'string' ? request.headers.authorization.trim() : '';
+
+    if (authHeader.startsWith('Bearer ') === true) {
+      token = authHeader.slice(7).trim();
+    }
+
+    // Native browser EventSource connections do not support custom headers.
+    // Allow token authentication via query parameter specifically for the
+    // live log streaming endpoint used by the built-in UI.
+    if (token === undefined && request.path === '/logs/stream' && typeof request.query?.token === 'string') {
+      token = request.query.token.trim();
+    }
+
+    // Reject requests if:
+    // - no configured bearer token exists
+    // - configured token is invalid/empty
+    // - supplied token does not match configured token
+    //
+    // Intentionally return a generic authentication error rather than exposing
+    // whether authentication is enabled or partially configured.
+    if (
+      typeof this.#options.auth.bearerToken !== 'string' ||
+      this.#options.auth.bearerToken === '' ||
+      token !== this.#options.auth.bearerToken
+    ) {
+      response.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+
+    // Authentication successful, continue processing the request.
+    next();
   }
 
   async #handleInfo(request, response) {
@@ -947,6 +1012,18 @@ export default class HomeKitUI {
     if (this.#options.logs === null || typeof this.#options.logs !== 'object' || this.#options.logs.constructor !== Object) {
       this.#options.logs = {};
     }
+
+    if (this.#options.auth === null || typeof this.#options.auth !== 'object' || this.#options.auth.constructor !== Object) {
+      this.#options.auth = {};
+    }
+
+    this.#options.auth = {
+      enabled: this.#options.auth.enabled === true,
+      bearerToken:
+        typeof this.#options.auth.bearerToken === 'string' && this.#options.auth.bearerToken.trim() !== ''
+          ? this.#options.auth.bearerToken.trim()
+          : undefined,
+    };
 
     this.#options.logs = {
       source: typeof this.#options.logs.source === 'string' && this.#options.logs.source !== '' ? this.#options.logs.source : 'auto',

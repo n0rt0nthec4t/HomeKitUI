@@ -12,6 +12,7 @@
 // - Render project-specific pages via `/api/page/:id`
 // - Handle configuration editing and save workflows
 // - Stream logs via Server-Sent Events (SSE)
+// - Provide optional bearer-token authentication support
 // - Provide error handling and user feedback
 //
 // Features:
@@ -20,14 +21,30 @@
 // - Back/forward browser navigation support
 // - Dynamic page loading and caching
 // - Live log streaming with automatic reconnect
+// - Local bearer-token persistence for authenticated backends
 //
-// Notes:
+// Architecture:
 // - Designed to work with the HomeKitUI backend module
 // - No external frontend framework (vanilla JS only)
 // - All UI rendering is handled via DOM updates
 // - Project-specific pages are data-driven or HTML-rendered
+// - Backend communication flows through a shared authenticated API wrapper
+// - Runtime updates handled via polling and SSE streams
 //
-// Code version 2026.05.05
+// Authentication:
+// - Optional bearer-token authentication support
+// - Tokens stored locally using browser localStorage
+// - API requests use standard Authorization: Bearer headers
+// - SSE log streaming falls back to query-token authentication because
+//   native browser EventSource does not support custom headers
+//
+// Notes:
+// - Designed to work with the HomeKitUI backend module
+// - Authentication remains optional and backend-controlled
+// - UI remains functional without authentication when disabled server-side
+// - Project-specific pages may provide trusted HTML/CSS when enabled by backend
+//
+// Code version 2026.05.07
 // Mark Hulskamp
 
 /* global EventSource, alert, confirm, document, fetch, window, DOMParser */
@@ -63,11 +80,67 @@ let logScrollTop = 0;
 let renderTimer = undefined;
 let renderPending = false;
 
-// Simple API wrapper with error handling
+// Retrieve the locally stored HomeKitUI bearer token.
+// Token persistence allows the browser UI to survive page reloads
+// without prompting the user for authentication every time.
+function authToken() {
+  return window.localStorage.getItem('homekitui-token') || '';
+}
+
+// Merge bearer-token authentication into an existing headers object.
+// This keeps API calls compatible with additional headers such as
+// Content-Type used by config save and action requests.
+//
+// If no token exists, return the original headers unchanged so
+// authentication remains fully optional when disabled server-side.
+function authHeaders(headers = {}) {
+  let token = authToken();
+
+  if (token === '') {
+    return headers;
+  }
+
+  return {
+    ...headers,
+    Authorization: 'Bearer ' + token,
+  };
+}
+
+// Simple API wrapper used by the frontend for all backend requests.
+// Handles:
+// - automatic bearer-token authentication injection
+// - JSON response parsing
+// - automatic authentication retry on HTTP 401
+// - consistent error propagation for UI handlers
 async function api(apiPath, options = {}) {
+  // Inject Authorization header when a locally stored token exists.
+  // Existing request headers (e.g. Content-Type) are preserved.
+  options.headers = authHeaders(options.headers || {});
+
   let response = await fetch(apiPath, options);
   let data = await response.json().catch(() => ({}));
 
+  // Authentication failed.
+  // Prompt the user for a bearer token and retry the request once.
+  //
+  // The token is stored in localStorage so future requests and page
+  // reloads continue working without repeated prompts.
+  if (response.status === 401) {
+    let token = window.prompt('HomeKitUI token');
+
+    if (typeof token === 'string' && token.trim() !== '') {
+      window.localStorage.setItem('homekitui-token', token.trim());
+
+      // Rebuild headers so the retry includes the new token.
+      options.headers = authHeaders(options.headers || {});
+
+      response = await fetch(apiPath, options);
+      data = await response.json().catch(() => ({}));
+    }
+  }
+
+  // Convert backend/API failures into normal JS exceptions so callers
+  // can handle them consistently with try/catch or alert().
   if (response.ok !== true) {
     throw new Error(data.error || 'Request failed');
   }
@@ -493,9 +566,9 @@ function statusPage() {
           ${restartIcon()}
         </button>
 
-        <a title="Backup Configuration" href="/api/backup">
+        <button title="Backup Configuration" data-action="backupConfig">
           ${downloadIcon()}
-        </a>
+        </button>
       </div>
     </div>
 
@@ -733,7 +806,12 @@ async function loadConfig(doRender = true) {
   }
 }
 
-// Save the in-memory config model back to the backend
+// Save the current in-memory configuration model back to the backend.
+// Handles:
+// - restart-required detection using schema metadata
+// - page-level restart overrides
+// - authenticated config persistence
+// - clearing tracked frontend change state after successful save
 async function saveConfig() {
   try {
     // Nothing changed, so there is nothing to save.
@@ -741,80 +819,115 @@ async function saveConfig() {
       return;
     }
 
-    // Determine the active page so we can honour any page-level override
+    // Determine the active page so page-level restart behaviour can override
+    // schema-level restart detection when explicitly configured.
     let page = (state.info.pages || []).find((item) => item.id === state.page);
 
-    // Default: assume no restart required unless proven otherwise
+    // Default to "no restart required" unless a changed field explicitly
+    // requires one via schema metadata or fallback behaviour.
     let restartRequired = false;
 
     // Page-level override:
-    // If explicitly set to false, we NEVER require restart for this page
+    // If restartRequired is explicitly false for this page, never require
+    // a restart regardless of changed field metadata.
     if (page?.restartRequired !== false) {
-      // Evaluate each changed config path against schema metadata
+      // Evaluate each changed config path against schema metadata.
+      //
+      // Restart detection walks upward through the schema hierarchy:
+      //
+      // Example:
+      // - options.flowRate
+      // - options
+      //
+      // This allows parent schema sections to define restart behaviour
+      // for entire groups of related configuration fields.
       restartRequired = [...state.changedPaths].some((changedPath) => {
-        // Break path into segments so we can walk up the schema tree
         let parts = changedPath.split('.');
 
         while (parts.length > 0) {
-          // Resolve schema at current depth (field -> parent -> parent...)
+          // Resolve schema at current hierarchy depth.
           let schema = getSchemaAtPath(parts.join('.'));
 
           if (schema !== undefined) {
-            // Explicit override: this field (or parent) does NOT require restart
+            // Explicit override:
+            // This field/group does NOT require restart.
             if (schema.restartRequired === false) {
               return false;
             }
 
-            // Explicit override: this field (or parent) DOES require restart
+            // Explicit override:
+            // This field/group DOES require restart.
             if (schema.restartRequired === true) {
               return true;
             }
           }
 
-          // Move up one level (e.g. options.flowRate -> options)
+          // Move upward one level in schema hierarchy.
           parts.pop();
         }
 
-        // No explicit schema override found
-        // Default to safe behaviour: restart required
+        // No explicit schema override found.
+        // Default to safe behaviour and assume restart required.
         return true;
       });
     }
 
-    // Persist updated configuration to backend
+    // Persist updated configuration to backend.
+    // Authentication headers are automatically injected by api().
     await api('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(state.config),
     });
 
-    // Clear tracked changes after successful save
+    // Clear tracked frontend change state after successful save.
     state.changedPaths.clear();
     updateSaveButton();
 
-    // Only show restart prompt when required
+    // Notify user only when restart is required for changes to apply.
     if (restartRequired === true) {
       alert('Configuration saved. Restart required for changes to take effect.');
     }
   } catch (error) {
-    // Surface any API/save errors to the user
+    // Surface backend validation, save, or transport failures directly to user.
+    alert(String(error.message || error));
+  }
+}
+
+// Download the current backend configuration as a local backup file.
+// Uses the authenticated API download helper because normal browser
+// links cannot attach Authorization headers for protected endpoints.
+async function backupConfig() {
+  try {
+    await downloadAPI('/api/backup', 'config.backup.json');
+  } catch (error) {
+    // Surface download or authentication failures directly to the user.
     alert(String(error.message || error));
   }
 }
 
 // Send a project-defined UI action to the backend.
 // Used by dynamic pages for controls that are not configuration changes,
-// such as dashboard buttons or device actions.
+// such as dashboard buttons, runtime commands, or device actions.
+//
+// Actions are intentionally generic so HomeKitUI does not need to know
+// about project-specific concepts such as irrigation zones, cameras,
+// locks, weather systems, or garage doors.
 async function sendAction(action, data = {}) {
   try {
+    // Ignore invalid action requests.
     if (typeof action !== 'string' || action === '') {
       return;
     }
 
-    // Preserve UI state across the dynamic page refresh.
+    // Preserve frontend-only UI state across dynamic page reloads.
+    // Some project pages use collapsible sections or visible-state
+    // toggles that should survive backend refreshes after actions.
     let collapseState = { ...state.collapse };
     let visibleState = { ...state.visible };
 
+    // Dispatch action request to backend.
+    // Authentication headers are automatically injected by api().
     await api('/api/action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -826,26 +939,46 @@ async function sendAction(action, data = {}) {
     });
 
     // Refresh the current dynamic page after the action completes so the
-    // dashboard reflects the updated device state immediately.
+    // dashboard reflects updated runtime/device state immediately.
+    //
+    // Status page is excluded because it already updates independently
+    // via the shared runtime polling timer.
     if (state.page !== 'status') {
       await loadPageData(state.page);
     }
 
+    // Restore preserved frontend-only UI state after page refresh.
     state.collapse = collapseState;
     state.visible = visibleState;
+
+    // Schedule a single re-render after all updates complete.
     scheduleRender();
   } catch (error) {
+    // Surface backend or transport failures directly to the user.
     alert(String(error.message || error));
   }
 }
 
-// Start live log stream from HomeKitUI
+// Start live log stream from HomeKitUI.
+// Uses Server-Sent Events so backend log entries can be pushed to the
+// browser without polling.
+//
+// EventSource cannot send custom Authorization headers, so when a bearer
+// token is stored locally it is appended as a query parameter. The backend
+// only accepts this query-token fallback for the log streaming endpoint.
 function startLogStream() {
   if (logStream !== undefined) {
     return;
   }
 
-  logStream = new EventSource('/api/logs/stream');
+  let token = authToken();
+  let url = '/api/logs/stream';
+
+  if (token !== '') {
+    url += '?token=' + encodeURIComponent(token);
+  }
+
+  logStream = new EventSource(url);
 
   logStream.onopen = () => {
     // When reconnecting after a restart, reload history so startup logs are not missed.
@@ -1256,18 +1389,28 @@ async function restartService() {
   await api('/api/service/restart', { method: 'POST' });
 }
 
-// Reset HomeKit pairing
+// Reset HomeKit pairing for a selected accessory.
+// This removes all paired HomeKit controllers for the accessory and
+// forces it back into an unpaired/setup state.
+//
+// Multi-accessory projects pass the accessory username explicitly.
+// Single-accessory projects fall back to the primary HomeKit accessory.
 async function resetPairing(username = state.homekit.username) {
+  // Pairing reset is destructive and requires the accessory to be
+  // re-added in Apple Home or another HomeKit controller.
   if (confirm('Reset HomeKit pairing? This removes all paired controllers.') !== true) {
     return;
   }
 
+  // Request pairing removal from backend.
+  // Authentication headers are automatically injected by api().
   await api('/api/homekit/reset', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username }),
   });
 
+  // Backend may restart automatically depending on project configuration.
   alert('Pairing reset. Restart and re-pair.');
 }
 
@@ -1284,6 +1427,41 @@ function getSchemaPathValue(schemaPath) {
 
     return value[key];
   }, state.config);
+}
+
+// Download a backend-generated file using authenticated fetch.
+// Normal browser links cannot include Authorization headers, so protected
+// downloads must be fetched first and then saved via a temporary object URL.
+async function downloadAPI(apiPath, filename) {
+  let response = await fetch(apiPath, {
+    headers: authHeaders(),
+  });
+
+  if (response.status === 401) {
+    await api('/api/info');
+
+    response = await fetch(apiPath, {
+      headers: authHeaders(),
+    });
+  }
+
+  if (response.ok !== true) {
+    let data = await response.json().catch(() => ({}));
+
+    throw new Error(data.error || 'Download failed');
+  }
+
+  let blob = await response.blob();
+  let url = window.URL.createObjectURL(blob);
+  let link = document.createElement('a');
+
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  window.URL.revokeObjectURL(url);
 }
 
 // Update the Save Configuration button state.
@@ -1557,6 +1735,12 @@ document.addEventListener('click', async (event) => {
     // Restart service (backend call)
     if (action === 'restartService') {
       await restartService();
+      return;
+    }
+
+    // Download configuration backup
+    if (action === 'backupConfig') {
+      await backupConfig();
       return;
     }
 
