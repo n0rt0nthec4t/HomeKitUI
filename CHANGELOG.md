@@ -2,7 +2,25 @@
 
 All notable changes to the `HomeKitUI` module are documented in this file.
 
-# 2026/05/05
+## 2026/05/10
+
+### Added
+- Added styled Web UI password prompt for authenticated HomeKitUI instances
+- Added optional browser persistence for the Web UI password
+- Added dedicated authentication-required screen when authentication is cancelled
+
+### Changed
+- The main UI is now blocked until authenticated API calls complete successfully
+- Concurrent authentication failures now share one prompt instead of opening duplicate prompts
+- User-facing authentication text now refers to the Web UI password while keeping bearer-token protocol support internally
+- Runtime polling and log streaming now pause while authentication is required
+
+### Fixed
+- Fixed partial unauthenticated rendering that could show empty pairing/log cards and a red auth banner
+- Fixed Web UI password prompt submission by mouse click and Enter key
+- Fixed masked password fields preserving existing values when left unchanged
+
+## 2026/05/05
 
 ### Added
 - Added generic `switchVisible` frontend action for switching visible UI sections without inline JavaScript

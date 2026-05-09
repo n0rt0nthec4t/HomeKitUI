@@ -2,18 +2,19 @@
 //
 // Client-side application for the HomeKitUI web interface.
 // Responsible for rendering the UI, managing navigation state,
-// interacting with backend API endpoints, and handling live updates.
+// interacting with backend API endpoints, handling authentication,
+// and coordinating live runtime updates.
 //
 // Responsibilities:
-// - Manage application state (current page, config, logs, HomeKit data)
-// - Handle page navigation (including URL hash routing and history)
-// - Fetch data from HomeKitUI API endpoints
-// - Render built-in pages (status, config, logs, HomeKit)
-// - Render project-specific pages via `/api/page/:id`
+// - Manage shared frontend application state
+// - Handle page navigation and browser history integration
+// - Fetch data from HomeKitUI backend API endpoints
+// - Render built-in pages (status, logs, HomeKit, config)
+// - Render project-specific dashboard/configuration pages
 // - Handle configuration editing and save workflows
 // - Stream logs via Server-Sent Events (SSE)
-// - Provide optional bearer-token authentication support
-// - Provide error handling and user feedback
+// - Manage optional bearer-token authentication
+// - Provide runtime error handling and user feedback
 //
 // Features:
 // - URL hash-based navigation (e.g. /#dashboard)
@@ -21,34 +22,42 @@
 // - Back/forward browser navigation support
 // - Dynamic page loading and caching
 // - Live log streaming with automatic reconnect
+// - Schema-driven configuration rendering
+// - Persistent collapse/visible UI state
 // - Local bearer-token persistence for authenticated backends
+// - Trusted backend-rendered HTML dashboard support
 //
 // Architecture:
-// - Designed to work with the HomeKitUI backend module
+// - Designed specifically for the HomeKitUI backend module
 // - No external frontend framework (vanilla JS only)
-// - All UI rendering is handled via DOM updates
-// - Project-specific pages are data-driven or HTML-rendered
+// - UI rendering performed via direct DOM updates
 // - Backend communication flows through a shared authenticated API wrapper
 // - Runtime updates handled via polling and SSE streams
+// - Project pages remain backend-driven and declarative
 //
 // Authentication:
 // - Optional bearer-token authentication support
-// - Tokens stored locally using browser localStorage
-// - API requests use standard Authorization: Bearer headers
+// - Supports session-only or persistent browser authentication
+// - API requests use Authorization: Bearer headers
 // - SSE log streaming falls back to query-token authentication because
 //   native browser EventSource does not support custom headers
+// - Authentication state can fully lock the UI until valid credentials
+//   are provided
 //
 // Notes:
-// - Designed to work with the HomeKitUI backend module
-// - Authentication remains optional and backend-controlled
+// - Authentication remains fully optional and backend-controlled
 // - UI remains functional without authentication when disabled server-side
 // - Project-specific pages may provide trusted HTML/CSS when enabled by backend
+// - All frontend actions route through centralized event delegation
 //
 // Code version 2026.05.07
 // Mark Hulskamp
 
 /* global EventSource, alert, confirm, document, fetch, window, DOMParser */
 'use strict';
+
+/* constants */
+const AUTH_REQUIRED_MESSAGE = 'Authentication required';
 
 // Runtime UI state shared across all render functions
 let state = {
@@ -63,10 +72,12 @@ let state = {
   visible: {},
   logs: [],
   error: undefined,
+  authRequired: false,
   changedPaths: new Set(),
 };
 
 // Core UI always includes the status page only
+let appName = document.title || 'HomeKitUI';
 let corePages = [{ id: 'status', title: 'Status', icon: 'home' }];
 let logReconnectTimer = undefined;
 let logStream = undefined;
@@ -79,12 +90,23 @@ let lastPageRefresh = 0;
 let logScrollTop = 0;
 let renderTimer = undefined;
 let renderPending = false;
+let sessionAuthToken = '';
+let pendingAuthRequest = undefined;
 
-// Retrieve the locally stored HomeKitUI bearer token.
-// Token persistence allows the browser UI to survive page reloads
-// without prompting the user for authentication every time.
+// Retrieve the active HomeKitUI bearer token.
+// Tokens can exist in two places:
+//
+// - sessionAuthToken
+//   Temporary in-memory token for the current browser tab/session only.
+//   Used when the user does NOT select "Remember for this browser".
+//
+// - localStorage
+//   Persistent browser storage used when the user enables
+//   "Remember for this browser". This survives page reloads and browser restarts.
+//
+// Session token always takes priority over persistent storage.
 function authToken() {
-  return window.localStorage.getItem('homekitui-token') || '';
+  return sessionAuthToken || window.localStorage.getItem('homekitui-token') || '';
 }
 
 // Merge bearer-token authentication into an existing headers object.
@@ -106,11 +128,229 @@ function authHeaders(headers = {}) {
   };
 }
 
+// Check whether an error represents the frontend authentication-required state.
+// This lets callers distinguish an expected auth cancellation/lockout from
+// normal backend, network, or rendering errors.
+function isAuthRequiredError(error) {
+  return error?.message === AUTH_REQUIRED_MESSAGE;
+}
+
+// Request HomeKitUI bearer-token authentication using a styled modal.
+// This replaces the native browser prompt so authentication matches the
+// rest of the HomeKitUI interface and theme styling.
+//
+// Returns:
+//   {
+//     token: string,
+//     remember: boolean
+//   }
+//
+// or undefined if cancelled by the user.
+function requestAuthToken() {
+  return new Promise((resolve) => {
+    // Create a fullscreen modal overlay which blocks interaction with
+    // the rest of the UI until authentication is completed or cancelled.
+    let overlay = document.createElement('div');
+
+    overlay.className = 'auth-overlay';
+
+    // Render the authentication dialog using the same visual style
+    // as the rest of HomeKitUI.
+    overlay.innerHTML = `
+      <form class="auth-card" data-auth-form>
+        <div class="auth-icon">${lockIcon()}</div>
+
+        <div class="auth-title">${escapeHTML(appName)}</div>
+
+        <div class="auth-subtitle">
+          Please enter the Web UI password from your configuration file to continue.
+        </div>
+
+        <label class="auth-field">
+          <span>Web UI password</span>
+
+          <div class="auth-input-wrap">
+            <input
+              class="auth-input"
+              type="password"
+              autocomplete="current-password"
+              placeholder="Enter Web UI password"
+            >
+
+            <button
+              class="auth-eye"
+              type="button"
+              title="Show password"
+              data-auth-show
+            >
+              ${eyeIcon()}
+            </button>
+          </div>
+        </label>
+
+        <label class="auth-remember">
+          <input type="checkbox" data-auth-remember>
+
+          <span>Remember for this browser</span>
+
+          <button
+            class="auth-info"
+            type="button"
+            title="The Web UI password is stored locally in this browser only. Recommended only on trusted devices."
+            data-auth-info
+          >
+            i
+          </button>
+        </label>
+
+        <div class="auth-actions">
+          <button class="secondary" type="button" data-auth-cancel>Cancel</button>
+          <button class="primary" type="submit" data-auth-submit>Continue</button>
+        </div>
+      </form>
+    `;
+
+    document.body.appendChild(overlay);
+
+    // Lookup dialog controls once after rendering.
+    let input = overlay.querySelector('.auth-input');
+    let remember = overlay.querySelector('[data-auth-remember]');
+    let show = overlay.querySelector('[data-auth-show]');
+    let info = overlay.querySelector('[data-auth-info]');
+    let form = overlay.querySelector('[data-auth-form]');
+    let cancel = overlay.querySelector('[data-auth-cancel]');
+    let closed = false;
+
+    // Cleanup helper used by all exit paths.
+    // Removes the modal and resolves the Promise back to the caller.
+    let close = (value) => {
+      if (closed === true) {
+        return;
+      }
+
+      closed = true;
+      overlay.remove();
+      resolve(value);
+    };
+
+    let submitAuth = (event) => {
+      event?.preventDefault();
+      event?.stopPropagation();
+
+      close({
+        token: input.value.trim(),
+        remember: remember.checked === true,
+      });
+    };
+
+    // User cancelled authentication.
+    cancel.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      close(undefined);
+    };
+
+    // User submitted a token.
+    form.onsubmit = submitAuth;
+
+    // Toggle password visibility for easier entry/debugging of long tokens.
+    show.onclick = () => {
+      input.type = input.type === 'password' ? 'text' : 'password';
+      show.title = input.type === 'password' ? 'Show password' : 'Hide password';
+    };
+
+    // Display additional information about local token storage behaviour.
+    info.onclick = () => {
+      alert(
+        'The Web UI password is stored locally in this browser only. ' +
+          'It is only sent to this HomeKitUI instance for authentication. ' +
+          'Use this option only on trusted/private devices.',
+      );
+    };
+
+    // Keyboard shortcuts:
+    // - Enter submits authentication
+    // - Escape cancels authentication
+    input.onkeydown = (event) => {
+      if (event.key === 'Enter') {
+        submitAuth(event);
+      }
+
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        close(undefined);
+      }
+    };
+
+    // Focus the token input automatically for immediate typing.
+    input.focus();
+  });
+}
+
+// Request and store a bearer token once, even if multiple API calls receive
+// authentication failures at the same time.
+async function requestStoredAuthToken() {
+  if (pendingAuthRequest !== undefined) {
+    return pendingAuthRequest;
+  }
+
+  pendingAuthRequest = requestAuthToken()
+    .then((auth) => {
+      if (auth !== undefined && typeof auth.token === 'string' && auth.token.trim() !== '') {
+        if (auth.remember === true) {
+          window.localStorage.setItem('homekitui-token', auth.token.trim());
+          sessionAuthToken = '';
+        } else {
+          window.localStorage.removeItem('homekitui-token');
+          sessionAuthToken = auth.token.trim();
+        }
+      }
+
+      return auth;
+    })
+    .finally(() => {
+      pendingAuthRequest = undefined;
+    });
+
+  return pendingAuthRequest;
+}
+
+function clearStoredAuthToken() {
+  sessionAuthToken = '';
+  window.localStorage.removeItem('homekitui-token');
+}
+
+function setAuthRequired(required) {
+  state.authRequired = required === true;
+
+  if (state.authRequired === true) {
+    state.error = undefined;
+
+    if (logStream !== undefined) {
+      try {
+        logStream.close();
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
+
+      logStream = undefined;
+    }
+
+    if (logReconnectTimer !== undefined) {
+      window.clearTimeout(logReconnectTimer);
+      logReconnectTimer = undefined;
+    }
+  }
+}
+
 // Simple API wrapper used by the frontend for all backend requests.
 // Handles:
 // - automatic bearer-token authentication injection
 // - JSON response parsing
 // - automatic authentication retry on HTTP 401
+// - optional persistent browser token storage
 // - consistent error propagation for UI handlers
 async function api(apiPath, options = {}) {
   // Inject Authorization header when a locally stored token exists.
@@ -120,24 +360,26 @@ async function api(apiPath, options = {}) {
   let response = await fetch(apiPath, options);
   let data = await response.json().catch(() => ({}));
 
-  // Authentication failed.
-  // Prompt the user for a bearer token and retry the request once.
-  //
-  // The token is stored in localStorage so future requests and page
-  // reloads continue working without repeated prompts.
-  if (response.status === 401) {
-    let token = window.prompt('HomeKitUI token');
+  while (response.status === 401) {
+    let auth = await requestStoredAuthToken();
 
-    if (typeof token === 'string' && token.trim() !== '') {
-      window.localStorage.setItem('homekitui-token', token.trim());
+    if (auth === undefined || typeof auth.token !== 'string' || auth.token.trim() === '') {
+      setAuthRequired(true);
+      throw new Error(AUTH_REQUIRED_MESSAGE);
+    }
 
-      // Rebuild headers so the retry includes the new token.
-      options.headers = authHeaders(options.headers || {});
+    // Rebuild headers so the retry includes the new token.
+    options.headers = authHeaders(options.headers || {});
 
-      response = await fetch(apiPath, options);
-      data = await response.json().catch(() => ({}));
+    response = await fetch(apiPath, options);
+    data = await response.json().catch(() => ({}));
+
+    if (response.status === 401) {
+      clearStoredAuthToken();
     }
   }
+
+  setAuthRequired(false);
 
   // Convert backend/API failures into normal JS exceptions so callers
   // can handle them consistently with try/catch or alert().
@@ -151,7 +393,12 @@ async function api(apiPath, options = {}) {
 // Initial load of UI data from backend
 async function load() {
   try {
+    setAuthRequired(false);
+    state.error = undefined;
+
     state.info = await api('/api/info');
+    appName = state.info.name || appName;
+    document.title = appName;
 
     if (Number.isFinite(Number(state.info?.uptime)) === true) {
       uptimeSeconds = Number(state.info.uptime);
@@ -162,19 +409,36 @@ async function load() {
     state.homekit = await api('/api/homekit');
     await loadLogs(false);
   } catch (error) {
+    if (isAuthRequiredError(error) === true) {
+      render();
+      return;
+    }
+
     state.error = String(error.message || error);
   }
 
   if (state.page !== 'status') {
-    await loadPageData(state.page);
+    try {
+      await loadPageData(state.page);
 
-    if (Object.keys(state.config).length === 0) {
-      await loadConfig(false);
+      if (Object.keys(state.config).length === 0) {
+        await loadConfig(false);
+      }
+    } catch (error) {
+      if (isAuthRequiredError(error) === true) {
+        render();
+        return;
+      }
+
+      state.error = String(error.message || error);
     }
   }
 
   render();
-  startLogStream();
+
+  if (state.authRequired !== true) {
+    startLogStream();
+  }
 }
 
 // Schedule a single render on the next browser tick.
@@ -201,6 +465,12 @@ function scheduleRender() {
 
 // Main render function - builds entire UI shell
 function render() {
+  if (state.authRequired === true) {
+    document.getElementById('project-style')?.remove();
+    document.getElementById('app').innerHTML = authRequiredPage();
+    return;
+  }
+
   let pages = [...corePages, ...(Array.isArray(state.info.pages) === true ? state.info.pages : [])];
   let page = (state.info.pages || []).find((item) => item.id === state.page);
   let style = document.getElementById('project-style');
@@ -238,6 +508,19 @@ function render() {
   renderSchemaMount();
   restoreCollapseState();
   restoreVisibleState();
+}
+
+function authRequiredPage() {
+  return `
+    <main class="auth-required-page">
+      <section class="auth-required-card">
+        <div class="auth-icon">${lockIcon()}</div>
+        <h1>Authentication required</h1>
+        <p>Enter the Web UI password to continue.</p>
+        <button class="primary" data-action="authenticate">Authenticate</button>
+      </section>
+    </main>
+  `;
 }
 
 // Render schema-backed form content into the current page after the main
@@ -455,17 +738,13 @@ function renderSchemaField(container, schema = {}, value, path) {
 
       input.appendChild(opt);
     });
-  }
-
-  // BOOLEAN
-  else if (schema.type === 'boolean') {
+  } else if (schema.type === 'boolean') {
+    // BOOLEAN
     input = document.createElement('input');
     input.type = 'checkbox';
     input.checked = value === true;
-  }
-
-  // NUMBER / INTEGER
-  else if (schema.type === 'number' || schema.type === 'integer') {
+  } else if (schema.type === 'number' || schema.type === 'integer') {
+    // NUMBER / INTEGER
     input = document.createElement('input');
     input.type = 'number';
     input.value = value ?? '';
@@ -484,16 +763,24 @@ function renderSchemaField(container, schema = {}, value, path) {
     } else {
       input.step = 'any';
     }
-  }
+  } else {
+    // STRING (default)
+    let isPassword = schema.format === 'password';
+    let hasExistingPassword = isPassword === true && typeof value === 'string' && value !== '';
 
-  // STRING (default)
-  else {
     input = document.createElement('input');
-    input.type = 'text';
-    input.value = value ?? '';
+    input.type = isPassword === true ? 'password' : 'text';
+    input.value = hasExistingPassword === true ? '' : (value ?? '');
+    input.placeholder = hasExistingPassword === true ? 'Leave unchanged' : '';
+    input.autocomplete = isPassword === true ? 'new-password' : 'off';
 
     // live update for "name" fields
     input.oninput = () => {
+      if (hasExistingPassword === true && input.value === '') {
+        setValueAtPath(state.config, path, value);
+        return;
+      }
+
       setValueAtPath(state.config, path, input.value);
 
       if (path[path.length - 1] === 'name') {
@@ -519,6 +806,10 @@ function renderSchemaField(container, schema = {}, value, path) {
       newValue = normaliseNumber(input.value);
       input.value = newValue ?? '';
     } else {
+      if (schema.format === 'password' && typeof value === 'string' && value !== '' && input.value === '') {
+        return;
+      }
+
       newValue = input.value;
     }
 
@@ -770,10 +1061,19 @@ async function setPage(page) {
   }
 
   if (page !== 'status') {
-    await loadPageData(page);
+    try {
+      await loadPageData(page);
 
-    if (Object.keys(state.config).length === 0) {
-      await loadConfig(false);
+      if (Object.keys(state.config).length === 0) {
+        await loadConfig(false);
+      }
+    } catch (error) {
+      if (isAuthRequiredError(error) === true) {
+        render();
+        return;
+      }
+
+      state.error = String(error.message || error);
     }
   }
 
@@ -785,8 +1085,11 @@ async function setPage(page) {
 async function loadPageData(pageId) {
   try {
     state.pageData[pageId] = await api(`/api/page/${pageId}`);
-    // eslint-disable-next-line no-unused-vars
   } catch (error) {
+    if (isAuthRequiredError(error) === true) {
+      throw error;
+    }
+
     state.pageData[pageId] = undefined;
   }
 }
@@ -798,12 +1101,31 @@ async function loadConfig(doRender = true) {
     state.schema = await api('/api/schema');
     state.uiSchema = await api('/api/ui-schema');
   } catch (error) {
+    if (isAuthRequiredError(error) === true) {
+      throw error;
+    }
+
     state.error = String(error.message || error);
   }
 
   if (doRender === true) {
     render();
   }
+}
+
+async function retryAuthentication() {
+  state.error = undefined;
+
+  let auth = await requestStoredAuthToken();
+
+  if (auth === undefined || typeof auth.token !== 'string' || auth.token.trim() === '') {
+    setAuthRequired(true);
+    render();
+    return;
+  }
+
+  setAuthRequired(false);
+  await load();
 }
 
 // Save the current in-memory configuration model back to the backend.
@@ -967,6 +1289,10 @@ async function sendAction(action, data = {}) {
 // token is stored locally it is appended as a query parameter. The backend
 // only accepts this query-token fallback for the log streaming endpoint.
 function startLogStream() {
+  if (state.authRequired === true) {
+    return;
+  }
+
   if (logStream !== undefined) {
     return;
   }
@@ -982,7 +1308,11 @@ function startLogStream() {
 
   logStream.onopen = () => {
     // When reconnecting after a restart, reload history so startup logs are not missed.
-    loadLogs(true);
+    loadLogs(true).catch((error) => {
+      if (isAuthRequiredError(error) === true) {
+        render();
+      }
+    });
   };
 
   logStream.onmessage = (event) => {
@@ -1030,8 +1360,11 @@ async function loadLogs(scroll = true) {
   try {
     state.logs = (await api('/api/logs')).logs || [];
     renderLogsOnly(scroll);
-    // eslint-disable-next-line no-unused-vars
   } catch (error) {
+    if (isAuthRequiredError(error) === true) {
+      throw error;
+    }
+
     // Ignore transient log reload failures
   }
 }
@@ -1115,6 +1448,10 @@ function startRuntimeTimer() {
   }
 
   runtimeTimer = window.setInterval(async () => {
+    if (state.authRequired === true) {
+      return;
+    }
+
     uptimeSeconds++;
 
     document.querySelectorAll('.uptime').forEach((uptime) => {
@@ -1669,6 +2006,24 @@ function downloadIcon() {
   return '<svg viewBox="0 0 24 24">' + '<path d="M12 3v12"/>' + '<path d="M7 10l5 5 5-5"/>' + '<path d="M5 21h14"/>' + '</svg>';
 }
 
+// Lock icon
+function lockIcon() {
+  return (
+    '<svg viewBox="0 0 24 24">' +
+    '<rect x="5" y="10" width="14" height="10" rx="2"/>' +
+    '<path d="M8 10V7a4 4 0 0 1 8 0v3"/>' +
+    '<path d="M12 14v2"/>' +
+    '</svg>'
+  );
+}
+
+// Eye icon
+function eyeIcon() {
+  return (
+    '<svg viewBox="0 0 24 24">' + '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/>' + '<circle cx="12" cy="12" r="3"/>' + '</svg>'
+  );
+}
+
 // Expose functions globally for inline onclick handlers
 window.scheduleRender = scheduleRender;
 window.setPage = setPage;
@@ -1741,6 +2096,11 @@ document.addEventListener('click', async (event) => {
     // Download configuration backup
     if (action === 'backupConfig') {
       await backupConfig();
+      return;
+    }
+
+    if (action === 'authenticate') {
+      await retryAuthentication();
       return;
     }
 

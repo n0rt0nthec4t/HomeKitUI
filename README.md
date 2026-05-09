@@ -28,7 +28,7 @@ The module operates at the **application level**, not the device level.
 - HomeKit pairing support (QR code, setup URI, status)
 - Multi-accessory support
 - Live log streaming (SSE with automatic reconnect)
-- Optional bearer-token authentication for API access
+- Optional Web UI password authentication for API access
 - URL-based navigation with browser history support
 - journald, file, and console log support
 - Custom dashboard pages (backend-rendered HTML)
@@ -41,17 +41,19 @@ The module operates at the **application level**, not the device level.
 
 ## Authentication
 
-HomeKitUI supports optional bearer-token authentication for API endpoints.
+HomeKitUI supports optional Web UI password authentication for API endpoints.
 
 When enabled:
 
-- API requests use `Authorization: Bearer <token>`
-- The frontend stores the token in browser `localStorage`
-- The user is prompted for the token after an authentication failure
+- API requests use `Authorization: Bearer <password>` internally
+- The frontend can store the Web UI password in browser `localStorage` when the user chooses "Remember for this browser"
+- The user is prompted for the Web UI password after an authentication failure
+- The main UI is blocked until authenticated requests complete successfully
+- If authentication is cancelled, the frontend shows a dedicated authentication-required screen instead of a partially loaded app
 - SSE log streaming uses a query-token fallback because browser `EventSource` cannot send custom headers
 - Static UI assets remain publicly reachable so the browser can load the frontend
 
-Token generation and persistence are handled by the host application.
+Password generation and persistence are handled by the host application. The password is supplied to HomeKitUI as `auth.bearerToken` because the underlying HTTP authentication mechanism is still a bearer token.
 
 Example:
 
@@ -90,7 +92,7 @@ To explicitly expose on all interfaces:
 host: '0.0.0.0'
 ```
 
-When exposing HomeKitUI on your network, bearer-token authentication is strongly recommended.
+When exposing HomeKitUI on your network, Web UI password authentication is strongly recommended.
 
 ---
 
@@ -135,7 +137,7 @@ await ui.start();
 | `version` | Application version |
 | `port` | Web UI port |
 | `host` | Optional bind address. Defaults to Express behaviour when omitted |
-| `auth` | Optional bearer-token authentication configuration |
+| `auth` | Optional Web UI password authentication configuration |
 | `configFile` | Path to config JSON |
 | `schemaFile` | Path to JSON schema |
 | `uiSchemaFile` | Path to UI schema (optional) |

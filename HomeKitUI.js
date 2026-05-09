@@ -43,7 +43,7 @@
 // - POST /api/action
 //
 // Authentication:
-// - Optional bearer-token authentication for all API endpoints
+// - Provide optional Web UI password authentication for API/UI access
 // - Uses standard HTTP Authorization: Bearer <token> header
 // - SSE log streaming supports token query parameter fallback because
 //   native browser EventSource does not support custom headers
@@ -277,6 +277,12 @@ export default class HomeKitUI {
   }
 
   #handleAuthentication(request, response, next) {
+    // Allow public UI metadata so the frontend can show the app name before auth.
+    if (request.path === '/info') {
+      next();
+      return;
+    }
+
     // Authentication is optional so existing standalone applications can continue
     // operating exactly as before unless bearer-token protection is explicitly enabled.
     if (this.#options.auth.enabled !== true) {
