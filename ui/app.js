@@ -38,7 +38,7 @@
 // Authentication:
 // - Optional bearer-token authentication support
 // - Supports session-only or persistent browser authentication
-// - API requests use Authorization: Bearer headers
+// - API requests use Authorisation: Bearer headers
 // - SSE log streaming falls back to query-token authentication because
 //   native browser EventSource does not support custom headers
 // - Authentication state can fully lock the UI until valid credentials
@@ -48,9 +48,9 @@
 // - Authentication remains fully optional and backend-controlled
 // - UI remains functional without authentication when disabled server-side
 // - Project-specific pages may provide trusted HTML/CSS when enabled by backend
-// - All frontend actions route through centralized event delegation
+// - All frontend actions route through centralised event delegation
 //
-// Code version 2026.05.07
+// Code version 2026.10.06
 // Mark Hulskamp
 
 /* global EventSource, alert, confirm, document, fetch, window, DOMParser */
@@ -92,6 +92,8 @@ let renderTimer = undefined;
 let renderPending = false;
 let sessionAuthToken = '';
 let pendingAuthRequest = undefined;
+let saveInProgress = false;
+let configRevision = 0;
 
 // Retrieve the active HomeKitUI bearer token.
 // Tokens can exist in two places:
@@ -352,27 +354,27 @@ function setAuthRequired(required) {
 // - automatic authentication retry on HTTP 401
 // - optional persistent browser token storage
 // - consistent error propagation for UI handlers
-async function api(apiPath, options = {}) {
-  // Inject Authorization header when a locally stored token exists.
-  // Existing request headers (e.g. Content-Type) are preserved.
+/**
+ * Fetch a response with shared credential retries for JSON and binary downloads.
+ * @param {string} apiPath Same-origin API endpoint.
+ * @param {RequestInit} [options={}] Fetch options and additional headers.
+ * @returns {Promise<Response>} Authenticated response; cancellation rejects.
+ */
+async function authenticatedFetch(apiPath, options = {}) {
   options.headers = authHeaders(options.headers || {});
-
   let response = await fetch(apiPath, options);
-  let data = await response.json().catch(() => ({}));
 
   while (response.status === 401) {
     let auth = await requestStoredAuthToken();
 
     if (auth === undefined || typeof auth.token !== 'string' || auth.token.trim() === '') {
       setAuthRequired(true);
+      render();
       throw new Error(AUTH_REQUIRED_MESSAGE);
     }
 
-    // Rebuild headers so the retry includes the new token.
     options.headers = authHeaders(options.headers || {});
-
     response = await fetch(apiPath, options);
-    data = await response.json().catch(() => ({}));
 
     if (response.status === 401) {
       clearStoredAuthToken();
@@ -380,9 +382,13 @@ async function api(apiPath, options = {}) {
   }
 
   setAuthRequired(false);
+  return response;
+}
 
-  // Convert backend/API failures into normal JS exceptions so callers
-  // can handle them consistently with try/catch or alert().
+async function api(apiPath, options = {}) {
+  let response = await authenticatedFetch(apiPath, options);
+  let data = await response.json().catch(() => ({}));
+
   if (response.ok !== true) {
     throw new Error(data.error || 'Request failed');
   }
@@ -787,7 +793,7 @@ function renderSchemaField(container, schema = {}, value, path) {
         let card = container.closest('.config-card');
         let title = card?.querySelector('.config-card-title');
 
-        if (title !== null) {
+        if (title !== undefined && title !== null) {
           title.textContent = input.value.trim() !== '' ? input.value : 'Item';
         }
       }
@@ -1030,10 +1036,10 @@ function renderConfigPage(page) {
           <button
             id="save-config"
             class="${hasChanges === true ? 'primary' : 'secondary'}"
-            ${hasChanges === true ? '' : 'disabled'}
+            ${saveInProgress === true || hasChanges !== true ? 'disabled' : ''}
             data-action="saveConfig"
           >
-            ${hasChanges === true ? 'Save Changes' : 'No Changes'}
+            ${saveInProgress === true ? 'Saving…' : hasChanges === true ? 'Save Changes' : 'No Changes'}
           </button>
 
           ${addButton}
@@ -1135,12 +1141,16 @@ async function retryAuthentication() {
 // - authenticated config persistence
 // - clearing tracked frontend change state after successful save
 async function saveConfig() {
-  try {
-    // Nothing changed, so there is nothing to save.
-    if (state.changedPaths.size === 0) {
-      return;
-    }
+  if (saveInProgress === true || state.changedPaths.size === 0) {
+    return;
+  }
 
+  // Keep edits available during I/O, but never allow overlapping save requests.
+  saveInProgress = true;
+  let submittedRevision = configRevision;
+  updateSaveButton();
+
+  try {
     // Determine the active page so page-level restart behaviour can override
     // schema-level restart detection when explicitly configured.
     let page = (state.info.pages || []).find((item) => item.id === state.page);
@@ -1203,8 +1213,10 @@ async function saveConfig() {
     });
 
     // Clear tracked frontend change state after successful save.
-    state.changedPaths.clear();
-    updateSaveButton();
+    // A later edit was not part of the submitted payload; retain its dirty state.
+    if (configRevision === submittedRevision) {
+      state.changedPaths.clear();
+    }
 
     // Notify user only when restart is required for changes to apply.
     if (restartRequired === true) {
@@ -1213,12 +1225,15 @@ async function saveConfig() {
   } catch (error) {
     // Surface backend validation, save, or transport failures directly to user.
     alert(String(error.message || error));
+  } finally {
+    saveInProgress = false;
+    updateSaveButton();
   }
 }
 
 // Download the current backend configuration as a local backup file.
 // Uses the authenticated API download helper because normal browser
-// links cannot attach Authorization headers for protected endpoints.
+// links cannot attach Authorisation headers for protected endpoints.
 async function backupConfig() {
   try {
     await downloadAPI('/api/backup', 'config.backup.json');
@@ -1285,7 +1300,7 @@ async function sendAction(action, data = {}) {
 // Uses Server-Sent Events so backend log entries can be pushed to the
 // browser without polling.
 //
-// EventSource cannot send custom Authorization headers, so when a bearer
+// EventSource cannot send custom Authorisation headers, so when a bearer
 // token is stored locally it is appended as a query parameter. The backend
 // only accepts this query-token fallback for the log streaming endpoint.
 function startLogStream() {
@@ -1767,20 +1782,10 @@ function getSchemaPathValue(schemaPath) {
 }
 
 // Download a backend-generated file using authenticated fetch.
-// Normal browser links cannot include Authorization headers, so protected
+// Normal browser links cannot include Authorisation headers, so protected
 // downloads must be fetched first and then saved via a temporary object URL.
 async function downloadAPI(apiPath, filename) {
-  let response = await fetch(apiPath, {
-    headers: authHeaders(),
-  });
-
-  if (response.status === 401) {
-    await api('/api/info');
-
-    response = await fetch(apiPath, {
-      headers: authHeaders(),
-    });
-  }
+  let response = await authenticatedFetch(apiPath);
 
   if (response.ok !== true) {
     let data = await response.json().catch(() => ({}));
@@ -1820,10 +1825,10 @@ function updateSaveButton() {
   button.className = hasChanges === true ? 'primary' : 'secondary';
 
   // Prevent pointless saves when nothing has changed.
-  button.disabled = hasChanges !== true;
+  button.disabled = saveInProgress === true || hasChanges !== true;
 
   // Make the button state obvious to the user.
-  button.textContent = hasChanges === true ? 'Save Changes' : 'No Changes';
+  button.textContent = saveInProgress === true ? 'Saving…' : hasChanges === true ? 'Save Changes' : 'No Changes';
 }
 
 // Escape HTML safely
@@ -1858,6 +1863,7 @@ function setValueAtPath(obj, path, value) {
   // Track changed path for restart logic.
   if (Array.isArray(path) === true && path.length > 0) {
     state.changedPaths.add(path.join('.'));
+    configRevision++;
   }
 
   // Refresh only the save button state, not the full page.
@@ -1925,21 +1931,40 @@ function icon(page) {
       let root = doc.querySelector('svg');
 
       if (root !== null && doc.querySelector('parsererror') === null) {
-        // Remove dangerous elements
-        root.querySelectorAll('script, foreignObject, iframe, object, embed, link, style').forEach((el) => el.remove());
+        // Only inert SVG geometry and local fragment references belong in icons.
+        let elements = new Set([
+          'svg', 'g', 'defs', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline',
+          'polygon', 'title', 'desc', 'use', 'symbol', 'lineargradient', 'radialgradient',
+          'stop', 'clippath', 'mask',
+        ]);
+        let attributes = new Set([
+          'xmlns', 'viewbox', 'width', 'height', 'id', 'role', 'aria-label', 'aria-hidden',
+          'd', 'points', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r', 'rx', 'ry',
+          'fill', 'fill-rule', 'fill-opacity', 'stroke', 'stroke-width', 'stroke-linecap',
+          'stroke-linejoin', 'stroke-miterlimit', 'stroke-dasharray', 'stroke-dashoffset',
+          'stroke-opacity', 'opacity', 'transform', 'preserveaspectratio', 'clip-path',
+          'clip-rule', 'mask', 'href', 'xlink:href', 'offset', 'stop-color', 'stop-opacity',
+          'gradientunits', 'gradienttransform', 'spreadmethod', 'fx', 'fy',
+        ]);
 
-        // Strip unsafe attributes
-        root.querySelectorAll('*').forEach((el) => {
-          [...el.attributes].forEach((attr) => {
-            let name = attr.name.toLowerCase();
-            let value = attr.value.trim().toLowerCase();
+        // Include the root: descendant-only queries miss svg onload attributes.
+        [root, ...root.querySelectorAll('*')].forEach((element) => {
+          if (elements.has(element.localName.toLowerCase()) !== true) {
+            element.remove();
+            return;
+          }
 
-            if (name.startsWith('on') === true) {
-              el.removeAttribute(attr.name);
-            }
+          [...element.attributes].forEach((attribute) => {
+            let name = attribute.name.toLowerCase();
+            let value = attribute.value.trim();
+            let localReference = /^#[a-zA-Z0-9_-]+$/.test(value) === true;
+            let unsafeURL = /url\s*\(/i.test(value) === true && /^url\(#[a-zA-Z0-9_-]+\)$/.test(value) !== true;
 
-            if ((name === 'href' || name === 'xlink:href') && value.startsWith('javascript:') === true) {
-              el.removeAttribute(attr.name);
+            if (
+              attributes.has(name) !== true || unsafeURL === true ||
+              ((name === 'href' || name === 'xlink:href') && localReference !== true)
+            ) {
+              element.removeAttribute(attribute.name);
             }
           });
         });

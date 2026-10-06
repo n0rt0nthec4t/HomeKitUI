@@ -21,7 +21,7 @@
 // Architecture:
 // - Intended to be used alongside HomeKitDevice-based projects
 // - Operates at the application/bridge level (not per-device instance)
-// - HomeKitUI owns the application shell, status page, logs, and maintenance pages
+// - HomeKitUI owns the application shell, status page, logs, and maintenance controls
 // - Host projects provide configuration schema, optional pages, and page data hooks
 // - UI communicates with the host application via API endpoints and hooks
 // - Authentication is handled centrally via Express middleware before route handling
@@ -59,7 +59,7 @@
 // - Journald is preferred in auto mode when running under systemd
 // - Console capture is used as fallback for direct/manual runs
 // - Built-in UI is always served from this module's ui folder
-// - Default host binding follows Express behaviour unless explicitly configured
+// - Default host binding is loopback unless explicitly configured
 //
 // Mark Hulskamp
 'use strict';
@@ -71,6 +71,7 @@ import { AnsiUp } from 'ansi_up';
 
 // Define nodejs module requirements
 import console from 'node:console';
+import { Buffer } from 'node:buffer';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -81,6 +82,9 @@ import { fileURLToPath } from 'node:url';
 // Define constants
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATIC_PATH = path.join(__dirname, 'ui');
+const MAX_LOG_LINE_CHARS = 16384;
+const MAX_LOG_HISTORY_BYTES = 1024 * 1024;
+const MAX_LOG_HISTORY_LINES = 10000;
 
 const LOG_LEVELS = {
   INFO: 'info',
@@ -90,17 +94,83 @@ const LOG_LEVELS = {
   DEBUG: 'debug',
 };
 
+/**
+ * @typedef {Object<string, *>} Configuration
+ * Complete JSON configuration. The host validates application-specific semantics.
+ */
+
+/**
+ * @typedef {object} UIPage
+ * @property {string} id Unique project page ID; status belongs to the built-in page.
+ * @property {string} title Sidebar label.
+ * @property {string} [icon] Built-in icon name.
+ * @property {string} [svg] Filtered SVG icon markup.
+ * @property {string} [schemaPath] Dot-separated path into configuration and schema.
+ * @property {boolean} [restartRequired] False suppresses page restart advice.
+ * @property {number} [refreshInterval] Dynamic-page refresh interval in milliseconds.
+ * @property {boolean} [trustedHTML] Allows host-owned HTML and CSS page payloads.
+ */
+
+/**
+ * @typedef {object} UIAccessory
+ * @property {string} [displayName] Accessory label.
+ * @property {string} [username] HAP accessory identifier.
+ * @property {string} [lastKnownUsername] Fallback HAP identifier.
+ * @property {string} [pincode] Setup code.
+ * @property {function(): string} [setupURI] HAP setup URI provider.
+ * @property {string} [_setupID] HAP setup identifier.
+ * @property {{username?: string, pincode?: string, setupID?: string,
+ *   paired?: function(): boolean, listPairings?: function(): object[]}} [_accessoryInfo] HAP pairing metadata.
+ */
+
+/**
+ * @typedef {object} UILogEntry
+ * @property {string} time ISO timestamp assigned during capture or conversion.
+ * @property {string} level Console level or info for file/journal lines.
+ * @property {string} message Bounded terminal line.
+ * @property {string} terminal Raw terminal text retained for ANSI conversion.
+ * @property {string} html ANSI-converted HTML.
+ */
+
+/**
+ * @typedef {object} HomeKitUIOptions
+ * @property {string} [name='HomeKit Device'] Application name.
+ * @property {string} [version] Application version; defaults to HomeKitUI.VERSION.
+ * @property {number} [port=8581] HTTP port; invalid values disable startup.
+ * @property {string} [host='127.0.0.1'] HTTP binding; an empty value uses Node's default.
+ * @property {{enabled?: boolean, bearerToken?: string}} [auth] Optional API bearer credentials.
+ * @property {string} [configFile] Configuration path for reads and default writes.
+ * @property {string} [schemaFile] JSON Schema path.
+ * @property {string} [uiSchemaFile] Optional UI schema path.
+ * @property {Object<string, string>} [theme] Browser theme colours.
+ * @property {UIPage[]} [pages=[]] Project page definitions.
+ * @property {UIAccessory} [accessory] Single-accessory fallback.
+ * @property {UIAccessory[]} [accessories=[]] Published accessories.
+ * @property {{Accessory?: {cleanupAccessoryData: function(string): void}}} [hap] HAP cleanup API.
+ * @property {Object<string, function>} [log] Host logger with level methods.
+ * @property {{source?: string, file?: string, unit?: string, lines?: number}} [logs] Log source and bounded history.
+ * @property {function(string): (object|Promise<object>)} [onGetPage] Project renderer payload provider.
+ * @property {function(string, object, string=): (void|Promise<void>)} [onAction] Project action dispatcher.
+ * @property {function(Configuration): (void|Promise<void>)} [onValidateConfig] Throw/reject to block persistence.
+ * @property {function(Configuration): (void|Promise<void>)} [onSaveConfig] Replace the default save write.
+ * @property {function(Configuration): (void|Promise<void>)} [onRestoreConfig] Replace the default restore write.
+ * @property {function(): (void|Promise<void>)} [onRestart] Restart after the response finishes.
+ * @property {function(string, UIAccessory=): (void|Promise<void>)} [onResetPairing] Host reset policy.
+ */
+
 // Define our HomeKit UI class
 export default class HomeKitUI {
   static DEFAULT_PORT = 8581;
-  static VERSION = '2026.05.07';
+  static VERSION = '2026.10.06';
 
-  // Shared console capture state
+  // Console capture state for the single management instance
   static DEFAULT_CONSOLE_HISTORY_LINES = 500;
-  static #consoleCaptured = false; // Prevent double-patching console.*
-  static #consoleHistory = []; // Recent console output for non-systemd/direct runs
-  static #consoleListeners = new Set(); // Live console listeners for SSE clients
-  static #consoleOriginal = {}; // Original console methods before capture
+  #consoleCaptured = false; // Prevent double-patching console.*
+  #consoleHistory = []; // Recent console output for non-systemd/direct runs
+  #consoleListeners = new Set(); // Live console listeners for SSE clients
+  #consoleHistoryBytes = 0;
+  #configWrite = Promise.resolve(); // Serialize saves and restores within this instance
+  #consoleOriginal = {}; // Original console methods before capture
 
   // Internal data only for this class
   #ansi = new AnsiUp(); // ANSI output to HTML converter for UI consumers
@@ -109,6 +179,9 @@ export default class HomeKitUI {
   #options = {}; // Runtime options
   #server = undefined; // HTTP server instance
 
+  /**
+   * @param {HomeKitUIOptions} [options={}] Host integration settings and callbacks.
+   */
   constructor(options = {}) {
     // Options must be a plain object. If not, fall back to defaults so the class
     // can still be constructed safely and fail later with useful endpoint errors.
@@ -149,9 +222,14 @@ export default class HomeKitUI {
     };
 
     this.#normaliseOptions();
-    HomeKitUI.#captureConsole(this.#options.logs.lines);
   }
 
+  /**
+   * Start the management server; top-level overrides replace nested option groups.
+   * @param {HomeKitUIOptions} [options={}] Settings available after host initialisation.
+   * @returns {Promise<boolean>} True when listening; false if already started or disabled.
+   * @throws {Error} If server creation or binding fails; a later call may retry.
+   */
   async start(options = {}) {
     // Runtime options may be supplied at start time because some values, like the
     // HAP accessory, may not exist until after the application has initialised.
@@ -163,7 +241,6 @@ export default class HomeKitUI {
     }
 
     this.#normaliseOptions();
-    HomeKitUI.#captureConsole(this.#options.logs.lines);
 
     // If the HTTP server is already running, don't bind twice. This makes start()
     // safe to call from app initialisation code that may be retried.
@@ -218,13 +295,43 @@ export default class HomeKitUI {
     // Start listening on either a specific host or localhost by default.
     // HomeKitUI now defaults to loopback-only binding for safer standalone
     // deployments unless the host application explicitly exposes another interface.
-    await new Promise((resolve) => {
-      if (typeof this.#options.host === 'string' && this.#options.host !== '') {
-        this.#server = this.#app.listen(this.#options.port, this.#options.host, resolve);
-      } else {
-        this.#server = this.#app.listen(this.#options.port, resolve);
+    try {
+      this.#captureConsole(this.#options.logs.lines);
+      await new Promise((resolve, reject) => {
+        // Keep an error listener after binding as well, so later server errors are logged.
+        let listening = false;
+        let onError = (error) => {
+          if (listening !== true) {
+            reject(error);
+          } else {
+            this.#log(LOG_LEVELS.ERROR, String(error?.stack ?? error));
+          }
+        };
+        let onListening = () => {
+          listening = true;
+          resolve();
+        };
+
+        this.#server = this.#app.listen(
+          this.#options.port,
+          typeof this.#options.host === 'string' && this.#options.host !== '' ? this.#options.host : undefined,
+          onListening,
+        );
+        this.#server.on('error', onError);
+      });
+    } catch (error) {
+      this.#server = undefined;
+      this.#app = undefined;
+      // Restore console methods and discard captured history.
+      if (this.#consoleCaptured === true) {
+        Object.assign(console, this.#consoleOriginal);
+        this.#consoleOriginal = {};
+        this.#consoleCaptured = false;
+        this.#consoleHistory = [];
+        this.#consoleHistoryBytes = 0;
       }
-    });
+      throw error;
+    }
 
     this.#log(LOG_LEVELS.SUCCESS, 'Setup HomeKitUI for "%s"', this.#options.name);
     this.#log(
@@ -240,6 +347,10 @@ export default class HomeKitUI {
     return true;
   }
 
+  /**
+   * Close log clients and the HTTP server, restoring console methods.
+   * @returns {Promise<boolean>} True when stopped; false if no server exists.
+   */
   async stop() {
     // No server means there is nothing to stop. Return false so the caller can tell
     // whether this call actually changed anything.
@@ -273,6 +384,14 @@ export default class HomeKitUI {
     // Drop references so the instance can be started again later if required.
     this.#server = undefined;
     this.#app = undefined;
+    // Restore console methods and discard captured history.
+    if (this.#consoleCaptured === true) {
+      Object.assign(console, this.#consoleOriginal);
+      this.#consoleOriginal = {};
+      this.#consoleCaptured = false;
+      this.#consoleHistory = [];
+      this.#consoleHistoryBytes = 0;
+    }
     return true;
   }
 
@@ -359,22 +478,8 @@ export default class HomeKitUI {
         throw new TypeError('Invalid configuration supplied');
       }
 
-      // Let the host application perform project-specific validation. This is where
-      // GPIO validation, HomeKit pin validation, schema validation, or migration can run.
-      if (typeof this.#options.onValidateConfig === 'function') {
-        await this.#options.onValidateConfig(request.body);
-      }
+      await this.#persistConfig(request.body, this.#options.onSaveConfig);
 
-      // Prefer host-controlled saving when provided. This allows the app to preserve
-      // formatting, regenerate defaults, or update runtime state before writing.
-      if (typeof this.#options.onSaveConfig === 'function') {
-        await this.#options.onSaveConfig(request.body);
-      } else {
-        await this.#writeJsonFile(this.#options.configFile, request.body);
-      }
-
-      // Restart requirement is evaluated by the frontend using changed paths and
-      // schema/page metadata. Restore/reset endpoints still force restart where needed.
       response.json({ ok: true });
     } catch (error) {
       this.#sendError(response, error);
@@ -515,6 +620,11 @@ export default class HomeKitUI {
       if (typeof this.#options.onResetPairing === 'function') {
         await this.#options.onResetPairing(username, accessory);
       } else {
+        if (accessory === undefined) {
+          response.status(404).json({ error: 'Unknown accessory username' });
+          return;
+        }
+
         // Default reset flow for HAP-NodeJS accessories:
         //
         // 1. Remove HAP-NodeJS pairing/persist data for the selected username.
@@ -533,8 +643,13 @@ export default class HomeKitUI {
         }
 
         if (typeof this.#options.onRestart === 'function') {
+          // Wait for the reply to finish; catch both synchronous and asynchronous hook failures.
+          response.once('finish', () => {
+            Promise.resolve().then(() => this.#options.onRestart()).catch((error) => {
+              this.#log(LOG_LEVELS.ERROR, String(error?.stack ?? error));
+            });
+          });
           response.json({ ok: true, restartRequired: true });
-          await this.#options.onRestart();
           return;
         }
       }
@@ -554,17 +669,13 @@ export default class HomeKitUI {
         return;
       }
 
-      // Register the finish handler BEFORE sending the response so we cannot miss
-      // the event if Express flushes the response immediately.
+      // Wait for the reply to finish; catch both synchronous and asynchronous hook failures.
       response.once('finish', () => {
-        this.#options.onRestart().catch((error) => {
+        Promise.resolve().then(() => this.#options.onRestart()).catch((error) => {
           this.#log(LOG_LEVELS.ERROR, String(error?.stack ?? error));
         });
       });
 
-      // Send success response before triggering restart. Some restart handlers may
-      // terminate the HTTP server or exit the process immediately, so waiting for
-      // the hook before responding can leave the browser with a failed request.
       response.json({ ok: true, restartRequired: true });
     } catch (error) {
       this.#sendError(response, error);
@@ -591,7 +702,7 @@ export default class HomeKitUI {
 
       // Console fallback is useful for direct/manual runs where systemd and a log
       // file are not available.
-      response.json({ logs: HomeKitUI.#consoleHistory.map((entry) => this.#logEntry(entry.terminal, entry.level, entry.time)) });
+      response.json({ logs: this.#consoleHistory.slice(-this.#options.logs.lines).map((entry) => this.#logEntry(entry.terminal, entry.level, entry.time)) });
     } catch (error) {
       this.#sendError(response, error);
     }
@@ -608,7 +719,22 @@ export default class HomeKitUI {
     response.write('event: connected\n');
     response.write('data: true\n\n');
 
+    // Disconnect handling must exist before asynchronous source discovery begins.
+    let disconnected = false;
+    let disconnect = () => {
+      disconnected = true;
+      let cleanup = this.#logListeners.get(response);
+      if (typeof cleanup === 'function') {
+        cleanup();
+      }
+    };
+    request.once('close', disconnect);
+    response.once('close', disconnect);
+
     let source = await this.#logSource();
+    if (disconnected === true) {
+      return;
+    }
 
     // Explicit file source wins. `tail -F` follows rotation/replacement better than
     // `tail -f`, which is useful when the host app or system rotates logs.
@@ -627,30 +753,21 @@ export default class HomeKitUI {
         }
 
         closed = true;
-        HomeKitUI.#consoleListeners.delete(listener);
+        this.#consoleListeners.delete(listener);
         this.#logListeners.delete(response);
       };
 
       let listener = (entry) => {
         try {
-          response.write('data: ' + JSON.stringify(this.#logEntry(entry.terminal, entry.level, entry.time)) + '\n\n');
+          this.#sendLogEvent(response, this.#logEntry(entry.terminal, entry.level, entry.time));
         } catch {
           cleanup();
         }
       };
 
-      HomeKitUI.#consoleListeners.add(listener);
+      this.#consoleListeners.add(listener);
       this.#logListeners.set(response, cleanup);
     }
-
-    // Remove closed clients so we don't leak response handles, child processes, or listeners.
-    request.on('close', () => {
-      let cleanup = this.#logListeners.get(response);
-
-      if (typeof cleanup === 'function') {
-        cleanup();
-      }
-    });
   }
 
   async #handleBackup(request, response) {
@@ -672,19 +789,7 @@ export default class HomeKitUI {
         throw new TypeError('Invalid configuration supplied');
       }
 
-      // Validate before writing so a broken backup cannot silently overwrite the
-      // working configuration unless the host validator allows it.
-      if (typeof this.#options.onValidateConfig === 'function') {
-        await this.#options.onValidateConfig(request.body);
-      }
-
-      // Allow the host app to handle restore differently from normal save. For
-      // example, it may want to keep the existing HomeKit username/pin.
-      if (typeof this.#options.onRestoreConfig === 'function') {
-        await this.#options.onRestoreConfig(request.body);
-      } else {
-        await this.#writeJsonFile(this.#options.configFile, request.body);
-      }
+      await this.#persistConfig(request.body, this.#options.onRestoreConfig);
 
       response.json({ ok: true, restartRequired: true });
     } catch (error) {
@@ -793,23 +898,77 @@ export default class HomeKitUI {
     return JSON.parse(await fs.readFile(file, 'utf8'));
   }
 
+  // Serialize save and restore operations, including validation and host hooks.
+  async #persistConfig(config, hook) {
+    let operation = this.#configWrite.catch(() => {}).then(async () => {
+      if (typeof this.#options.onValidateConfig === 'function') {
+        await this.#options.onValidateConfig(config);
+      }
+      if (typeof hook === 'function') {
+        await hook(config);
+      } else {
+        await this.#writeJsonFile(this.#options.configFile, config);
+      }
+    });
+    this.#configWrite = operation;
+    await operation;
+  }
+
   async #writeJsonFile(file, data) {
-    // Require a valid file path before writing so bad setup cannot write somewhere
-    // unexpected or fail with a cryptic fs error.
     if (typeof file !== 'string' || file === '') {
       throw new Error('JSON file path not configured');
     }
 
-    // Write formatted JSON with a trailing newline to match the style used by the
-    // standalone config files.
-    await fs.writeFile(file, JSON.stringify(data, null, 2) + '\n');
+    // Resolve existing symlinks so replacing the file preserves the link itself.
+    let target = path.resolve(file);
+    let mode = 0o600;
+    try {
+      target = await fs.realpath(target);
+      mode = (await fs.stat(target)).mode & 0o777;
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    let directory = await fs.mkdtemp(path.join(path.dirname(target), '.homekitui-'));
+    let temporary = path.join(directory, 'config.json');
+    let handle;
+    try {
+      handle = await fs.open(temporary, 'wx', mode);
+      await handle.chmod(mode);
+      await handle.writeFile(JSON.stringify(data, null, 2) + '\n');
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      // Same-filesystem rename exposes either the previous or the completed file.
+      await fs.rename(temporary, target);
+    } finally {
+      try {
+        await handle?.close();
+      } finally {
+        await fs.rm(directory, { recursive: true, force: true });
+      }
+    }
   }
 
   async #readLogFile(file, lines) {
     // File logs are read as plain text and converted into UI log entries line by line.
-    // This intentionally reads the whole file for simplicity; host apps should pass
-    // a rotated/sensible log file rather than huge archival logs.
-    let content = await fs.readFile(file, 'utf8');
+    // Read only a bounded tail so archival logs cannot exhaust process memory.
+    let handle = await fs.open(file, 'r');
+    let content;
+    try {
+      let size = (await handle.stat()).size;
+      let offset = Math.max(0, size - MAX_LOG_HISTORY_BYTES);
+      let buffer = Buffer.alloc(Math.min(size, MAX_LOG_HISTORY_BYTES));
+      let { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      content = buffer.subarray(0, bytesRead).toString('utf8');
+      // The first line in a bounded tail may have started before the read window.
+      if (offset > 0) {
+        content = content.slice(content.indexOf('\n') + 1);
+      }
+    } finally {
+      await handle.close();
+    }
 
     return content
       .split('\n')
@@ -821,6 +980,15 @@ export default class HomeKitUI {
   async #readJournal(lines) {
     let entries = [];
     let buffer = '';
+    let entryBytes = 0;
+    let append = (line) => {
+      let entry = this.#logEntry(line);
+      entries.push(entry);
+      entryBytes += Buffer.byteLength(entry.message);
+      while (entries.length > lines || entryBytes > MAX_LOG_HISTORY_BYTES) {
+        entryBytes -= Buffer.byteLength(entries.shift().message);
+      }
+    };
     let args = await this.#journalArgs(lines);
 
     await new Promise((resolve) => {
@@ -835,7 +1003,7 @@ export default class HomeKitUI {
         finished = true;
 
         if (buffer.trim() !== '') {
-          entries.push(this.#logEntry(buffer));
+          append(buffer);
         }
 
         resolve();
@@ -844,12 +1012,12 @@ export default class HomeKitUI {
       proc.stdout.on('data', (data) => {
         buffer += String(data);
 
-        let lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
+        let chunkLines = buffer.split('\n');
+        buffer = (chunkLines.pop() ?? '').slice(-MAX_LOG_LINE_CHARS);
 
-        lines.forEach((line) => {
+        chunkLines.forEach((line) => {
           if (line.trim() !== '') {
-            entries.push(this.#logEntry(line));
+            append(line);
           }
         });
       });
@@ -986,12 +1154,12 @@ export default class HomeKitUI {
       buffer += String(data);
 
       let lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+      buffer = (lines.pop() ?? '').slice(-MAX_LOG_LINE_CHARS);
 
       lines.forEach((line) => {
-        if (line.trim() !== '') {
+        if (closed !== true && line.trim() !== '') {
           try {
-            response.write('data: ' + JSON.stringify(this.#logEntry(line)) + '\n\n');
+            this.#sendLogEvent(response, this.#logEntry(line));
           } catch {
             cleanup();
           }
@@ -1003,8 +1171,27 @@ export default class HomeKitUI {
     proc.on('close', cleanup);
   }
 
+  // A stalled client must not accumulate an unbounded HTTP write queue.
+  // EventSource reconnects and reloads bounded history after this disconnect.
+  #sendLogEvent(response, entry) {
+    if (response.write('data: ' + JSON.stringify(entry) + '\n\n') === false) {
+      let cleanup = this.#logListeners.get(response);
+      if (typeof cleanup === 'function') {
+        cleanup();
+      }
+      response.destroy();
+    }
+  }
+
+  /**
+   * @param {string} line Terminal output, truncated to the configured record bound.
+   * @param {string} [level='info'] Captured severity.
+   * @param {string} [time] ISO timestamp; defaults to the conversion time.
+   * @returns {UILogEntry} Record consumed by history and SSE clients.
+   */
   #logEntry(line, level = LOG_LEVELS.INFO, time = new Date().toISOString()) {
     // Convert raw terminal text into the structured object expected by app.js.
+    line = line.slice(-MAX_LOG_LINE_CHARS);
     return {
       time,
       level,
@@ -1047,7 +1234,7 @@ export default class HomeKitUI {
       unit: typeof this.#options.logs.unit === 'string' && this.#options.logs.unit !== '' ? this.#options.logs.unit : undefined,
       lines:
         Number.isFinite(Number(this.#options.logs.lines)) === true && Number(this.#options.logs.lines) > 0
-          ? Number(this.#options.logs.lines)
+          ? Math.min(MAX_LOG_HISTORY_LINES, Math.max(1, Math.floor(Number(this.#options.logs.lines))))
           : HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES,
     };
   }
@@ -1109,25 +1296,22 @@ export default class HomeKitUI {
     }
   }
 
-  static #captureConsole(lines = HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES) {
+  #captureConsole(lines) {
     // Patch console once so direct/manual runs still have a live log source when
     // journald and file logs are unavailable.
-    if (HomeKitUI.#consoleCaptured === true) {
+    if (this.#consoleCaptured === true) {
       return;
     }
 
-    // Ensure lines is a valid positive integer. Fallback to default if invalid.
-    lines = Number.isFinite(Number(lines)) === true && Number(lines) > 0 ? Number(lines) : HomeKitUI.DEFAULT_CONSOLE_HISTORY_LINES;
-
-    HomeKitUI.#consoleCaptured = true;
+    this.#consoleCaptured = true;
 
     // Preserve original console methods so we can still output to stdout/stderr
     // after intercepting log calls.
-    HomeKitUI.#consoleOriginal.log = console.log;
-    HomeKitUI.#consoleOriginal.info = console.info;
-    HomeKitUI.#consoleOriginal.warn = console.warn;
-    HomeKitUI.#consoleOriginal.error = console.error;
-    HomeKitUI.#consoleOriginal.debug = console.debug;
+    this.#consoleOriginal.log = console.log;
+    this.#consoleOriginal.info = console.info;
+    this.#consoleOriginal.warn = console.warn;
+    this.#consoleOriginal.error = console.error;
+    this.#consoleOriginal.debug = console.debug;
 
     [
       ['log', LOG_LEVELS.INFO],
@@ -1136,9 +1320,16 @@ export default class HomeKitUI {
       ['error', LOG_LEVELS.ERROR],
       ['debug', LOG_LEVELS.DEBUG],
     ].forEach(([method, level]) => {
+      let original = this.#consoleOriginal[method];
       console[method] = (...args) => {
+        // Cached method references remain usable after capture stops.
+        if (this.#consoleCaptured !== true) {
+          original.apply(console, args);
+          return;
+        }
+
         // Format console arguments into a single string using Node.js util.format
-        let line = util.format(...args);
+        let line = util.format(...args).slice(-MAX_LOG_LINE_CHARS);
 
         // Construct a log entry that can be consumed by the UI or streamed via SSE
         let entry = {
@@ -1149,16 +1340,17 @@ export default class HomeKitUI {
         };
 
         // Append to in-memory history buffer
-        HomeKitUI.#consoleHistory.push(entry);
+        this.#consoleHistory.push(entry);
 
-        // Trim history buffer to configured size using splice (O(n)),
-        // replacing the previous shift() loop (O(n²) under heavy load)
-        if (HomeKitUI.#consoleHistory.length > lines) {
-          HomeKitUI.#consoleHistory.splice(0, HomeKitUI.#consoleHistory.length - lines);
+        this.#consoleHistoryBytes += Buffer.byteLength(line);
+        let remove = 0;
+        while (this.#consoleHistory.length - remove > lines || this.#consoleHistoryBytes > MAX_LOG_HISTORY_BYTES) {
+          this.#consoleHistoryBytes -= Buffer.byteLength(this.#consoleHistory[remove++].message);
         }
+        this.#consoleHistory.splice(0, remove);
 
         // Notify active listeners (e.g. SSE log stream clients)
-        HomeKitUI.#consoleListeners.forEach((listener) => {
+        this.#consoleListeners.forEach((listener) => {
           try {
             listener(entry);
           } catch {
@@ -1167,7 +1359,7 @@ export default class HomeKitUI {
         });
 
         // Forward the original console call so logs still appear normally
-        HomeKitUI.#consoleOriginal[method](...args);
+        original.apply(console, args);
       };
     });
   }
