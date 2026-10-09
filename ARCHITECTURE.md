@@ -270,7 +270,7 @@ One mutable state object holds the active page, metadata, accessory details, con
 
 Navigation uses the URL hash, including hash-change handling. Startup loads application info, HomeKit details, and log history, then project data and configuration when a project page is active. Rendering replaces the shell HTML, mounts schema controls, and restores collapse and visibility state. A scheduled-render helper combines pending updates.
 
-A one-second runtime timer advances displayed uptime and polls application and accessory status every 30 seconds. Project-page refresh intervals are expressed in milliseconds. Refresh applies to non-Status pages without `schemaPath` and pauses while a form or action control has focus. Authentication lock suspends these updates.
+A one-second runtime timer advances displayed uptime and polls application and accessory status every 30 seconds. Project-page refresh intervals are expressed in milliseconds. Refresh applies to non-Status pages without `schemaPath`. Focused inputs and textareas, active pointer gestures, and pending backend actions protect controls from refresh. Other control interactions pause background refresh for five seconds; retained dropdown or button focus does not prolong the pause. Only one automatic page read runs at a time. Deferred renders recheck interaction state and restore dropdown/button focus after replacing the shell. Authentication lock suspends these updates.
 
 Ordinary displayed values are escaped. Sidebar controls and host actions use delegated events and data attributes. Named icons use built-in SVGs; supplied SVGs pass through an element and attribute allowlist that filters the root and descendants, removes active content, and restricts URL references to local fragments. Trusted project HTML is inserted directly under the explicit page opt-in described below.
 
@@ -297,7 +297,7 @@ Project rendering supports three flows:
 - A `{ type: 'list', items }` payload renders escaped title, subtitle, and value rows.
 - Other payloads use the configuration-page shell; a valid `schemaPath` mounts the schema form.
 
-Trusted HTML controls can dispatch `{ action, data, page }` through `/api/action`. After an action completes, the browser reloads the active project's payload and restores collapse and visibility state. The host owns the markup and action semantics.
+Trusted HTML controls can dispatch `{ action, data, page }` through `/api/action`. Actions invalidate older page reads before dispatch. Only the latest request for each page may apply its payload or ordinary error. After an action completes, the browser reloads its originating page's payload and renders it if that page is still active. Collapse and visibility preferences remain in memory, including changes made while an action was pending. The host owns the markup and action semantics.
 
 Failed project-page loads retain the last successful payload and display the backend or transport error. A successful reload updates the payload and clears the error.
 

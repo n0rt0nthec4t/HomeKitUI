@@ -6,6 +6,9 @@ All notable changes to the `HomeKitUI` module are documented in this file.
 
 ### Fixed
 
+- Resumed dynamic refresh five seconds after dropdown/button interaction while preserving focus and protecting text edits.
+- Deferred control replacement throughout pointer gestures and pending backend actions, and rejected obsolete page responses after actions.
+- Declared Node.js globals in the module's test-only lint configuration.
 - Preserved JSON types for enum controls, including boolean choices.
 - Copied structured defaults and enum values so new items cannot mutate siblings or schema definitions.
 - Kept credentials and UI preferences usable in memory when browser storage fails, with feedback when a password cannot be remembered.

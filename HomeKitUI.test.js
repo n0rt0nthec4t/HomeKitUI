@@ -1479,3 +1479,194 @@ test('transport failures preserve page payload and authentication cancellation s
   assert.equal(f.evaluate('state.authRequired'), true);
   assert.equal(f.evaluate('state.pageData.dashboard.items[0].title'), 'Known state');
 });
+
+// Delayed network responses exercise the shared control lifecycle without host-specific actions.
+test('in-flight and queued refresh renders wait for complete pointer interaction', async () => {
+  const f = await browserFixture();
+  f.evaluate(
+    'Date.now=()=>100000;state.page="dashboard";state.info.pages=[{id:"dashboard",refreshInterval:1000}];' +
+    'lastStatusPoll=Date.now();lastPageRefresh=0;let finishRead;api=()=>new Promise(resolve=>{finishRead=' +
+    'resolve})',
+  );
+  const timer = [...f.timers.values()].find((entry) => entry.interval === true);
+  const refresh = timer.callback();
+  const button = { closest: () => button };
+  f.events.get('document:pointerdown')({ target: button, pointerId: 1 });
+  f.evaluate('finishRead({type:"list",items:[]})');
+  await refresh;
+  f.evaluate('api=async()=>({type:"list",items:[]})');
+  const before = f.app.innerHTML;
+  f.timers.get(f.evaluate('renderTimer')).callback();
+  assert.equal(f.app.innerHTML, before);
+  assert.equal(f.evaluate('renderPending'), true);
+  f.evaluate('Date.now=()=>106000');
+  await timer.callback();
+  f.timers.get(f.evaluate('renderTimer')).callback();
+  assert.equal(f.app.innerHTML, before);
+  // Cancellation releases the gesture but retains the five-second cooldown.
+  f.events.get('document:pointercancel')({ pointerId: 1 });
+  f.evaluate('Date.now=()=>111000');
+  await timer.callback();
+  f.timers.get(f.evaluate('renderTimer')).callback();
+  assert.equal(f.evaluate('renderPending'), false);
+  assert.notEqual(f.app.innerHTML, before);
+});
+
+for (const tagName of ['INPUT', 'TEXTAREA']) {
+  test('an in-flight refresh preserves focused ' + tagName + ' edits until blur', async () => {
+    const f = await browserFixture();
+    f.evaluate(
+      'state.page="dashboard";state.info.pages=[{id:"dashboard",refreshInterval:1000}];lastStatusPoll=Date.' +
+      'now();let finishRead;api=()=>new Promise(resolve=>{finishRead=resolve})',
+    );
+    const refresh = f.evaluate('loadPageData("dashboard").then(()=>scheduleRender(true))');
+    f.document.activeElement = new MockElement(tagName);
+    f.evaluate('finishRead({type:"list",items:[]})');
+    await refresh;
+    const before = f.app.innerHTML;
+    f.timers.get(f.evaluate('renderTimer')).callback();
+    assert.equal(f.app.innerHTML, before);
+    assert.equal(f.evaluate('renderPending'), true);
+    f.document.activeElement = null;
+    f.evaluate('lastPageRefresh=Date.now()');
+    await [...f.timers.values()].find((entry) => entry.interval === true).callback();
+    f.timers.get(f.evaluate('renderTimer')).callback();
+    assert.equal(f.evaluate('renderPending'), false);
+  });
+}
+
+for (const action of ['power', 'zone']) {
+  test('one ' + action + ' click dispatches once and rejects reads from before the action', async () => {
+    const f = await browserFixture();
+    f.evaluate(
+      'Date.now=()=>100000;state.page="dashboard";state.info.pages=[{id:"dashboard",refreshInterval:1000}];' +
+      'lastStatusPoll=Date.now();let resolveOld;let resolveAction;let actionCalls=[];let pageCalls=0;api=as' +
+      'ync(path,options)=>{if(path==="/api/action"){actionCalls.push(JSON.parse(options.body));return new P' +
+      'romise(resolve=>{resolveAction=resolve})}pageCalls++;return pageCalls===1?new Promise(resolve=>{reso' +
+      'lveOld=resolve}):{type:"list",items:[{title:"Updated"}]}}',
+    );
+    const old = f.evaluate('loadPageData("dashboard")');
+    const button = {
+      dataset: { sendAction: action, payload: '{"enabled":true}' },
+      closest: (selector) => selector === '[data-send-action]' || selector.startsWith('input,') === true ? button : null,
+    };
+    f.events.get('document:pointerdown')({ target: button, pointerId: 2 });
+    f.events.get('document:pointerup')({ pointerId: 2 });
+    const click = f.events.get('document:click')({ target: button });
+    assert.deepEqual(f.snapshot('actionCalls'), [{ action, data: { enabled: true }, page: 'dashboard' }]);
+    // A slow backend action outlasts cooldown without allowing background reads/renders.
+    f.evaluate('Date.now=()=>106000');
+    await [...f.timers.values()].find((entry) => entry.interval === true).callback();
+    assert.equal(f.evaluate('pageCalls'), 1);
+    f.evaluate('scheduleRender(true)');
+    const before = f.app.innerHTML;
+    f.timers.get(f.evaluate('renderTimer')).callback();
+    assert.equal(f.app.innerHTML, before);
+    f.evaluate('resolveAction({ok:true})');
+    await click;
+    f.timers.get(f.evaluate('renderTimer')).callback();
+    assert.match(f.app.innerHTML, /Updated/);
+    f.evaluate('resolveOld({type:"list",items:[{title:"Stale"}]})');
+    await old;
+    assert.equal(f.snapshot('state.pageData.dashboard.items[0].title'), 'Updated');
+    assert.equal(f.evaluate('pendingActionCount'), 0);
+  });
+}
+
+test('obsolete page failures cannot overwrite action results and failed actions release refresh', async () => {
+  const f = await browserFixture();
+  f.evaluate('state.page="dashboard";let rejectOld;api=()=>new Promise((resolve,reject)=>{rejectOld=reject})');
+  const old = f.evaluate('loadPageData("dashboard")');
+  f.evaluate('api=async()=>({type:"list",items:[{title:"Updated"}]})');
+  await f.evaluate('sendAction("run",{})');
+  f.evaluate('rejectOld(new Error("Old failure"))');
+  await old;
+  assert.equal(f.evaluate('state.error'), undefined);
+  f.evaluate('api=async()=>{throw new Error("Action failed")}');
+  await f.evaluate('sendAction("run",{})');
+  assert.equal(f.evaluate('pendingActionCount'), 0);
+  assert.equal(f.alerts.at(-1), 'Action failed');
+});
+
+test('action completion keeps its original page and current frontend preferences', async () => {
+  const f = await browserFixture();
+  f.evaluate(
+    'state.page="dashboard";let completeAction;let pagePaths=[];api=async(path)=>{if(path==="/api/action"' +
+    ')return new Promise(resolve=>{completeAction=resolve});pagePaths.push(path);return {type:"list",item' +
+    's:[]}}',
+  );
+  const action = f.evaluate('sendAction("run",{})');
+  f.evaluate('state.page="other";state.collapse.panel=true;state.visible.group="new";completeAction({ok:true})');
+  await action;
+  assert.deepEqual(f.snapshot('pagePaths'), ['/api/page/dashboard']);
+  assert.equal(f.evaluate('state.page'), 'other');
+  assert.equal(f.evaluate('state.collapse.panel'), true);
+  assert.equal(f.evaluate('state.visible.group'), 'new');
+});
+
+for (const tagName of ['SELECT', 'BUTTON']) {
+  test('automatic refresh resumes after cooldown and restores ' + tagName + ' focus', async () => {
+    const f = await browserFixture();
+    f.evaluate(
+      'Date.now=()=>100000;state.page="dashboard";state.info.pages=[{id:"dashboard",refreshInterval:1000}];' +
+      'lastStatusPoll=Date.now();lastPageRefresh=0;api=async()=>({type:"list",items:[]})',
+    );
+    let controls;
+    const replacement = {
+      tagName,
+      getAttribute: (attribute) => attribute === 'id' ? 'same-control' : null,
+      focus: () => {
+        f.document.activeElement = replacement;
+      },
+    };
+    const original = {
+      tagName,
+      getAttribute: replacement.getAttribute,
+      closest: () => original,
+    };
+    controls = [original];
+    f.app.querySelectorAll = () => controls;
+    Object.defineProperty(f.app, 'innerHTML', {
+      set: () => {
+        controls = [replacement];
+        f.document.activeElement = null;
+      },
+    });
+    f.document.activeElement = original;
+    f.events.get('document:pointerdown')({ target: original, pointerId: 3 });
+    f.events.get('document:pointerup')({ pointerId: 3 });
+    const timer = [...f.timers.values()].find((entry) => entry.interval === true);
+    f.evaluate('Date.now=()=>104999');
+    await timer.callback();
+    assert.equal(f.document.activeElement, original);
+    assert.equal(f.evaluate('renderTimer'), undefined);
+    f.evaluate('Date.now=()=>105000');
+    await timer.callback();
+    f.timers.get(f.evaluate('renderTimer')).callback();
+    assert.equal(f.document.activeElement, replacement);
+  });
+}
+
+test('slow automatic reads do not overlap and newest explicit reads win', async () => {
+  const f = await browserFixture();
+  f.evaluate(
+    'Date.now=()=>100000;state.page="dashboard";state.info.pages=[{id:"dashboard",refreshInterval:1000}];' +
+    'lastStatusPoll=Date.now();let finishRead;let reads=0;api=()=>{reads++;return new Promise(resolve=>{f' +
+    'inishRead=resolve})}',
+  );
+  const timer = [...f.timers.values()].find((entry) => entry.interval === true);
+  const first = timer.callback();
+  f.evaluate('Date.now=()=>102000');
+  await timer.callback();
+  assert.equal(f.evaluate('reads'), 1);
+  f.evaluate('finishRead({type:"list",items:[]})');
+  await first;
+  assert.equal(f.evaluate('pageRefreshInProgress'), false);
+  f.evaluate('let finishOld;api=()=>new Promise(resolve=>{finishOld=resolve})');
+  const old = f.evaluate('loadPageData("dashboard")');
+  f.evaluate('api=async()=>({type:"list",items:[{title:"Latest"}]})');
+  await f.evaluate('loadPageData("dashboard")');
+  f.evaluate('finishOld({type:"list",items:[{title:"Old"}]})');
+  await old;
+  assert.equal(f.snapshot('state.pageData.dashboard.items[0].title'), 'Latest');
+});

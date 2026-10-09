@@ -116,9 +116,16 @@ let uptimeSeconds = 0;
 let runtimeTimer = undefined;
 let lastStatusPoll = 0;
 let lastPageRefresh = 0;
+let lastControlInteraction = 0;
+// Request generations also invalidate reads begun before a backend action.
+let pageRequestGenerations = new Map();
+let pendingActionCount = 0;
+let pageRefreshInProgress = false;
+let activeControlPointers = new Set();
 let logScrollTop = 0;
 let renderTimer = undefined;
 let renderPending = false;
+let renderBackgroundOnly = false;
 let sessionAuthToken = '';
 let browserStorageOverrides = new Map();
 let pendingAuthRequest = undefined;
@@ -508,10 +515,27 @@ async function load() {
   }
 }
 
-// Schedule a single render on the next browser tick.
-// This allows multiple state changes in the same event loop to collapse into
-// one render() call and avoids timers competing with UI actions.
-function scheduleRender() {
+// Protect both request initiation and deferred renders. The cooldown is independent
+// of focus because some browsers do not focus buttons on pointer interaction.
+/**
+ * @param {boolean} [includeCooldown=true] Whether to include the five-second interaction pause.
+ * @returns {boolean} Whether replacing dynamic-page controls would interrupt interaction.
+ */
+function pageInteractionActive(includeCooldown = true) {
+  let focused = document.activeElement;
+  return pendingActionCount > 0 || activeControlPointers.size > 0 ||
+    (focused !== null && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA')) ||
+    (includeCooldown === true && Date.now() - lastControlInteraction < 5000);
+}
+
+// Coalesce renders, retaining deferred work until editing, pointer interaction,
+// or pending actions finish. Action results can render without waiting for cooldown.
+/**
+ * @param {boolean} [background=false] Whether this render came only from automatic page refresh.
+ * @returns {void} Schedules or retains a single render for the current page.
+ */
+function scheduleRender(background = false) {
+  renderBackgroundOnly = renderPending === true ? renderBackgroundOnly === true && background === true : background === true;
   renderPending = true;
 
   if (renderTimer !== undefined) {
@@ -521,7 +545,8 @@ function scheduleRender() {
   renderTimer = window.setTimeout(() => {
     renderTimer = undefined;
 
-    if (renderPending !== true) {
+    if (renderPending !== true ||
+      (state.authRequired !== true && state.page !== 'status' && pageInteractionActive(renderBackgroundOnly) === true)) {
       return;
     }
 
@@ -537,6 +562,16 @@ function render() {
     document.getElementById('app').innerHTML = authRequiredPage();
     return;
   }
+
+  // Full-shell rendering removes the old focused node. Match the same control
+  // by its stable identity and occurrence, allowing payload and label updates.
+  let app = document.getElementById('app');
+  let focused = document.activeElement;
+  let focusAttributes = ['id', 'name', 'data-action', 'data-send-action', 'data-page', 'data-target', 'data-path'];
+  let focusCandidates = [...app.querySelectorAll('select, button, [data-action], [data-send-action]')];
+  let matchesFocus = (control) => control.tagName === focused?.tagName &&
+    focusAttributes.every((attribute) => control.getAttribute(attribute) === focused.getAttribute(attribute));
+  let focusOccurrence = focusCandidates.filter(matchesFocus).indexOf(focused);
 
   let pages = [...corePages, ...(Array.isArray(state.info.pages) === true ? state.info.pages : [])];
   let page = (state.info.pages || []).find((item) => item.id === state.page);
@@ -568,6 +603,12 @@ function render() {
   renderSchemaMount();
   restoreCollapseState();
   restoreVisibleState();
+
+  if (focusOccurrence >= 0) {
+    let replacement = [...app.querySelectorAll('select, button, [data-action], [data-send-action]')]
+      .filter(matchesFocus)[focusOccurrence];
+    replacement?.focus({ preventScroll: true });
+  }
 }
 
 function authRequiredPage() {
@@ -1123,16 +1164,28 @@ async function setPage(page) {
 // Load dynamic page data from backend
 /**
  * @param {string} pageId Configured host page ID.
- * @returns {Promise<void>} Updates the payload and clears errors on success; preserves the payload on ordinary failure.
+ * @returns {Promise<void>} Applies only the latest read; preserves the payload on failure or invalidation.
  * @throws {Error} When authentication is cancelled.
  */
 async function loadPageData(pageId) {
+  let generation = (pageRequestGenerations.get(pageId) ?? 0) + 1;
+  pageRequestGenerations.set(pageId, generation);
+
   try {
-    state.pageData[pageId] = await api(('/api/page/' + pageId));
+    let payload = await api(('/api/page/' + pageId));
+    if (pageRequestGenerations.get(pageId) !== generation) {
+      return;
+    }
+    state.pageData[pageId] = payload;
     state.error = undefined;
   } catch (error) {
     if (isAuthRequiredError(error) === true) {
       throw error;
+    }
+
+    // Obsolete failures must not overwrite a newer action result either.
+    if (pageRequestGenerations.get(pageId) !== generation) {
+      return;
     }
 
     // Preserve the last successful payload so transient failures leave useful state.
@@ -1300,48 +1353,37 @@ async function backupConfig() {
  * @returns {Promise<void>} Dispatches for the active page, refreshes its data, and reports errors.
  */
 async function sendAction(action, data = {}) {
+  if (typeof action !== 'string' || action === '') {
+    return;
+  }
+
+  // Capture the originating page and invalidate older reads before dispatch.
+  // This applies to every host-defined action, including overlapping controls.
+  let pageId = state.page;
+  pendingActionCount++;
+  pageRequestGenerations.set(pageId, (pageRequestGenerations.get(pageId) ?? 0) + 1);
+
   try {
-    // Ignore invalid action requests.
-    if (typeof action !== 'string' || action === '') {
-      return;
-    }
-
-    // Preserve frontend-only UI state across dynamic page reloads.
-    // Some project pages use collapsible sections or visible-state
-    // toggles that should survive backend refreshes after actions.
-    let collapseState = { ...state.collapse };
-    let visibleState = { ...state.visible };
-
-    // Dispatch action request to backend.
-    // Authentication headers are automatically injected by api().
     await api('/api/action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action,
-        data,
-        page: state.page,
-      }),
+      body: JSON.stringify({ action, data, page: pageId }),
     });
 
-    // Refresh the current dynamic page after the action completes so the
-    // dashboard reflects updated runtime/device state immediately.
-    //
-    // Status page is excluded because it already updates independently
-    // via the shared runtime polling timer.
-    if (state.page !== 'status') {
-      await loadPageData(state.page);
+    if (pageId !== 'status') {
+      await loadPageData(pageId);
     }
 
-    // Restore preserved frontend-only UI state after page refresh.
-    state.collapse = collapseState;
-    state.visible = visibleState;
-
-    // Schedule a single re-render after all updates complete.
-    scheduleRender();
+    if (state.page === pageId) {
+      // Collapse/visibility state stays in memory; do not restore an old snapshot
+      // over frontend interactions made while the action was pending.
+      lastPageRefresh = Date.now();
+      scheduleRender();
+    }
   } catch (error) {
-    // Surface backend or transport failures directly to the user.
     alert(String(error.message || error));
+  } finally {
+    pendingActionCount--;
   }
 }
 
@@ -1568,17 +1610,16 @@ function startRuntimeTimer() {
     // otherwise the page can re-render while a select/dropdown is open.
     let page = (state.info.pages || []).find((item) => item.id === state.page);
     let refreshInterval = Number(page?.refreshInterval);
-    let activeElement = document.activeElement;
-    let uiControlActive =
-      activeElement !== null &&
-      (activeElement.tagName === 'SELECT' ||
-        activeElement.tagName === 'INPUT' ||
-        activeElement.tagName === 'TEXTAREA' ||
-        activeElement.tagName === 'BUTTON' ||
-        activeElement.closest('[data-action]') !== null);
+    let uiControlActive = pageInteractionActive();
+
+    // Retry deferred rendering without starting another page request first.
+    if (renderPending === true) {
+      scheduleRender(renderBackgroundOnly);
+    }
 
     if (
       uiControlActive !== true &&
+      pageRefreshInProgress === false &&
       state.page !== 'status' &&
       page?.schemaPath === undefined &&
       Number.isFinite(refreshInterval) === true &&
@@ -1587,8 +1628,15 @@ function startRuntimeTimer() {
     ) {
       lastPageRefresh = now;
 
-      await loadPageData(page.id);
-      scheduleRender();
+      // Async interval callbacks can overlap. Keep one automatic read in flight
+      // so slow responses are not continually invalidated by the next poll.
+      pageRefreshInProgress = true;
+      try {
+        await loadPageData(page.id);
+        scheduleRender(true);
+      } finally {
+        pageRefreshInProgress = false;
+      }
     }
   }, 1000);
 }
@@ -2287,6 +2335,29 @@ document.addEventListener('click', async (event) => {
     }
   }
 });
+
+// Track actual control interaction independently from retained browser focus.
+['pointerdown', 'keydown', 'input', 'change'].forEach((type) => {
+  document.addEventListener(type, (event) => {
+    if (event.target.closest('input, textarea, select, button, [data-action], [data-send-action]') !== null) {
+      lastControlInteraction = Date.now();
+      if (type === 'pointerdown') {
+        activeControlPointers.add(event.pointerId);
+      }
+    }
+  });
+});
+
+// Hold controls for the complete pointer gesture, even if it lasts over five
+// seconds. Pointer release bubbles before click; deferred renders run afterward.
+['pointerup', 'pointercancel'].forEach((type) => {
+  document.addEventListener(type, (event) => {
+    if (activeControlPointers.delete(event.pointerId) === true) {
+      lastControlInteraction = Date.now();
+    }
+  });
+});
+window.addEventListener('blur', () => activeControlPointers.clear());
 
 // Global change handler using event delegation.
 // Handles generic frontend-only UI changes without inline JavaScript.

@@ -1,3 +1,4 @@
+// ESLint configuration for HomeKitUI source and its isolated Node.js test harness.
 import stylistic from '@stylistic/eslint-plugin';
 import parserTs from '@typescript-eslint/parser';
 
@@ -38,4 +39,22 @@ export default [{
     'no-unused-vars': ['error'],
     'no-empty': ['error'],
   },
-}];
+},
+  {
+    // Node globals and deliberate console capture belong to tests only.
+    // Browser and backend source retain their existing lint restrictions.
+    files: ['**/*.test.{js,mjs}'],
+    languageOptions: {
+      globals: {
+        queueMicrotask: 'readonly',
+        URL: 'readonly',
+        Blob: 'readonly',
+        console: 'readonly',
+        process: 'readonly',
+      },
+    },
+    rules: {
+      'no-console': 'off',
+    },
+  },
+];
