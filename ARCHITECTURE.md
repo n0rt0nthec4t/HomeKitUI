@@ -4,7 +4,7 @@
 
 `HomeKitUI` is a shared management module for standalone HAP-NodeJS applications. It provides an HTTP API and browser shell around application-owned configuration, accessories, logs, and maintenance hooks.
 
-**Version:** 2026.10.06 (`HomeKitUI.VERSION`)
+**Version:** 2026.10.09 (`HomeKitUI.VERSION`)
 
 **Primary module:** `HomeKitUI.js`
 
@@ -155,6 +155,8 @@ When `auth.enabled === true`, protected requests must match the configured token
 
 The browser presents a password dialog after a 401 and retries the request. A token can stay in memory for the session or be remembered in local storage under `homekitui-token`. Cancelling authentication switches to a locked screen, stops log streaming, and suspends runtime updates until authentication resumes.
 
+Browser storage failures leave credentials and UI preferences usable in the current tab. A failed attempt to remember a password reports that it will remain available only in that tab. Session overrides prevent denied token removal from reusing stale browser credentials during the session.
+
 The host supplies the token and transport or deployment-level access controls. HomeKitUI does not generate credentials or terminate TLS.
 
 ---
@@ -297,6 +299,8 @@ Project rendering supports three flows:
 
 Trusted HTML controls can dispatch `{ action, data, page }` through `/api/action`. After an action completes, the browser reloads the active project's payload and restores collapse and visibility state. The host owns the markup and action semantics.
 
+Failed project-page loads retain the last successful payload and display the backend or transport error. A successful reload updates the payload and clears the error.
+
 ---
 
 ## Schema Form Model
@@ -304,6 +308,8 @@ Trusted HTML controls can dispatch `{ action, data, page }` through `/api/action
 `schemaPath` selects both a configuration value and its corresponding JSON Schema section. Schema traversal follows `properties` for objects and `items` for arrays.
 
 Forms support object properties, object-array cards with add/remove controls, comma-separated primitive arrays, enum selects, boolean checkboxes, numeric inputs, and text/password inputs. Numeric handling applies minimum, maximum, and integer conversion. New values use schema defaults where supplied. A blank password input preserves an existing non-empty password value.
+
+Enum controls retain the selected value's original JSON type. Structured defaults and enum values are copied so editing a configuration item cannot mutate another item's defaults or the schema definition.
 
 Edits update the in-memory configuration and record dotted paths in `changedPaths`. Save is enabled while changes exist and posts the entire configuration to `/api/config`. Only one save runs at a time. Successful saving clears changed paths when the configuration revision still matches the submitted revision. Edits made during the request remain dirty and can be saved afterward.
 

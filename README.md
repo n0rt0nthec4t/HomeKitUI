@@ -248,5 +248,5 @@ History and individual lines are bounded. Live logs use SSE, with browser reconn
 ## Version
 
 ```js
-static VERSION = '2026.10.06';
+static VERSION = '2026.10.09';
 ```

@@ -50,14 +50,43 @@
 // - Project-specific pages may provide trusted HTML/CSS when enabled by backend
 // - All frontend actions route through centralised event delegation
 //
-// Code version 2026.10.06
+// Code version 2026.10.09
 // Mark Hulskamp
 
-/* global EventSource, alert, confirm, document, fetch, window, DOMParser */
+/* global EventSource, alert, confirm, document, fetch, window, DOMParser, structuredClone */
 'use strict';
 
 /* constants */
 const AUTH_REQUIRED_MESSAGE = 'Authentication required';
+
+/**
+ * @typedef {import('../HomeKitUI.js').Configuration} Configuration
+ * @typedef {import('../HomeKitUI.js').UIPage} UIPage
+ * @typedef {import('../HomeKitUI.js').UIPageData} UIPageData
+ * @typedef {import('../HomeKitUI.js').UITheme} UITheme
+ * @typedef {import('../HomeKitUI.js').UILogEntry} UILogEntry
+ * @typedef {import('../HomeKitUI.js').UIAccessoryDetails} UIAccessoryDetails
+ */
+
+/**
+ * @typedef {object} SchemaDefinition
+ * @property {string} [type] Rendered object, array, boolean, number, integer, or string type.
+ * @property {string} [title] Field label.
+ * @property {Object<string, SchemaDefinition>} [properties] Object child schemas.
+ * @property {SchemaDefinition} [items] Schema shared by array entries.
+ * @property {*} [default] JSON value copied for each new configuration item.
+ * @property {*[]} [enum] Allowed JSON values in display order.
+ * @property {number} [minimum] Lower numeric bound.
+ * @property {number} [maximum] Upper numeric bound.
+ * @property {string} [format] Password fields preserve existing secrets when blank.
+ * @property {boolean} [restartRequired] Restart advice inherited by descendants.
+ */
+
+/**
+ * @typedef {object} AuthSubmission
+ * @property {string} token Trimmed user-supplied credential.
+ * @property {boolean} remember Whether to attempt browser persistence.
+ */
 
 // Runtime UI state shared across all render functions
 let state = {
@@ -91,6 +120,7 @@ let logScrollTop = 0;
 let renderTimer = undefined;
 let renderPending = false;
 let sessionAuthToken = '';
+let browserStorageOverrides = new Map();
 let pendingAuthRequest = undefined;
 let saveInProgress = false;
 let configRevision = 0;
@@ -107,8 +137,49 @@ let configRevision = 0;
 //   "Remember for this browser". This survives page reloads and browser restarts.
 //
 // Session token always takes priority over persistent storage.
+/**
+ * @returns {string} Session credential or remembered browser credential; empty if absent.
+ */
 function authToken() {
-  return sessionAuthToken || window.localStorage.getItem('homekitui-token') || '';
+  return sessionAuthToken || readBrowserStorage('homekitui-token') || '';
+}
+
+/**
+ * @param {string} key HomeKitUI browser preference key.
+ * @returns {string|null} Stored value, session override, or null if unavailable.
+ */
+function readBrowserStorage(key) {
+  // Session writes take precedence even if persistence failed or removal was denied.
+  if (browserStorageOverrides.has(key) === true) {
+    return browserStorageOverrides.get(key);
+  }
+
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    // Restricted browser storage must not prevent API access or page rendering.
+    return null;
+  }
+}
+
+/**
+ * @param {string} key HomeKitUI browser preference key.
+ * @param {string|null} value Session value; null also removes the persisted value.
+ * @returns {boolean} Whether the browser persisted the update successfully.
+ */
+function writeBrowserStorage(key, value) {
+  browserStorageOverrides.set(key, value);
+  try {
+    if (value === null) {
+      window.localStorage.removeItem(key);
+    } else {
+      window.localStorage.setItem(key, value);
+    }
+    return true;
+  } catch {
+    // Keep preferences and credentials usable for this tab when storage is denied.
+    return false;
+  }
 }
 
 // Merge bearer-token authentication into an existing headers object.
@@ -117,6 +188,10 @@ function authToken() {
 //
 // If no token exists, return the original headers unchanged so
 // authentication remains fully optional when disabled server-side.
+/**
+ * @param {Object<string, string>} [headers={}] Additional request headers.
+ * @returns {Object<string, string>} Headers with the active bearer credential when available.
+ */
 function authHeaders(headers = {}) {
   let token = authToken();
 
@@ -133,6 +208,10 @@ function authHeaders(headers = {}) {
 // Check whether an error represents the frontend authentication-required state.
 // This lets callers distinguish an expected auth cancellation/lockout from
 // normal backend, network, or rendering errors.
+/**
+ * @param {Error} error Request or authentication failure.
+ * @returns {boolean} Whether the user cancelled authentication.
+ */
 function isAuthRequiredError(error) {
   return error?.message === AUTH_REQUIRED_MESSAGE;
 }
@@ -148,6 +227,9 @@ function isAuthRequiredError(error) {
 //   }
 //
 // or undefined if cancelled by the user.
+/**
+ * @returns {Promise<AuthSubmission|undefined>} Submitted credentials, or undefined on cancellation.
+ */
 function requestAuthToken() {
   return new Promise((resolve) => {
     // Create a fullscreen modal overlay which blocks interaction with
@@ -158,59 +240,25 @@ function requestAuthToken() {
 
     // Render the authentication dialog using the same visual style
     // as the rest of HomeKitUI.
-    overlay.innerHTML = `
-      <form class="auth-card" data-auth-form>
-        <div class="auth-icon">${lockIcon()}</div>
-
-        <div class="auth-title">${escapeHTML(appName)}</div>
-
-        <div class="auth-subtitle">
-          Please enter the Web UI password from your configuration file to continue.
-        </div>
-
-        <label class="auth-field">
-          <span>Web UI password</span>
-
-          <div class="auth-input-wrap">
-            <input
-              class="auth-input"
-              type="password"
-              autocomplete="current-password"
-              placeholder="Enter Web UI password"
-            >
-
-            <button
-              class="auth-eye"
-              type="button"
-              title="Show password"
-              data-auth-show
-            >
-              ${eyeIcon()}
-            </button>
-          </div>
-        </label>
-
-        <label class="auth-remember">
-          <input type="checkbox" data-auth-remember>
-
-          <span>Remember for this browser</span>
-
-          <button
-            class="auth-info"
-            type="button"
-            title="The Web UI password is stored locally in this browser only. Recommended only on trusted devices."
-            data-auth-info
-          >
-            i
-          </button>
-        </label>
-
-        <div class="auth-actions">
-          <button class="secondary" type="button" data-auth-cancel>Cancel</button>
-          <button class="primary" type="submit" data-auth-submit>Continue</button>
-        </div>
-      </form>
-    `;
+    overlay.innerHTML = (
+      '\n' + '      <form class="auth-card" data-auth-form>\n' + '        <div class="auth-icon">' + lockIcon() + '</div>\n' + '\n' +
+      '        <div class="auth-title">' + escapeHTML(appName) + '</div>\n' + '\n' + '        <div class="auth-subtitle">\n' +
+      '          Please enter the Web UI password from your configuration file to continue.\n' + '        </div>\n' + '\n' +
+      '        <label class="auth-field">\n' + '          <span>Web UI password</span>\n' + '\n' +
+      '          <div class="auth-input-wrap">\n' + '            <input\n' + '              class="auth-input"\n' +
+      '              type="password"\n' + '              autocomplete="current-password"\n' +
+      '              placeholder="Enter Web UI password"\n' + '            >\n' + '\n' + '            <button\n' +
+      '              class="auth-eye"\n' + '              type="button"\n' + '              title="Show password"\n' +
+      '              data-auth-show\n' + '            >\n' + '              ' + eyeIcon() + '\n' + '            </button>\n' +
+      '          </div>\n' + '        </label>\n' + '\n' + '        <label class="auth-remember">\n' +
+      '          <input type="checkbox" data-auth-remember>\n' + '\n' + '          <span>Remember for this browser</span>\n' + '\n' +
+      '          <button\n' + '            class="auth-info"\n' + '            type="button"\n' +
+      '            title="The Web UI password is stored locally in this browser only. Recommended only on trusted devices."\n' +
+      '            data-auth-info\n' + '          >\n' + '            i\n' + '          </button>\n' + '        </label>\n' + '\n' +
+      '        <div class="auth-actions">\n' + '          <button class="secondary" type="button" data-auth-cancel>Cancel</button>\n' +
+      '          <button class="primary" type="submit" data-auth-submit>Continue</button>\n' + '        </div>\n' + '      </form>\n' +
+      '    '
+    );
 
     document.body.appendChild(overlay);
 
@@ -292,6 +340,9 @@ function requestAuthToken() {
 
 // Request and store a bearer token once, even if multiple API calls receive
 // authentication failures at the same time.
+/**
+ * @returns {Promise<AuthSubmission|undefined>} Shared pending submission; credentials stay usable if storage fails.
+ */
 async function requestStoredAuthToken() {
   if (pendingAuthRequest !== undefined) {
     return pendingAuthRequest;
@@ -300,12 +351,13 @@ async function requestStoredAuthToken() {
   pendingAuthRequest = requestAuthToken()
     .then((auth) => {
       if (auth !== undefined && typeof auth.token === 'string' && auth.token.trim() !== '') {
+        sessionAuthToken = auth.token.trim();
         if (auth.remember === true) {
-          window.localStorage.setItem('homekitui-token', auth.token.trim());
-          sessionAuthToken = '';
+          if (writeBrowserStorage('homekitui-token', sessionAuthToken) === false) {
+            alert('Browser storage is unavailable. The Web UI password will be kept for this tab only.');
+          }
         } else {
-          window.localStorage.removeItem('homekitui-token');
-          sessionAuthToken = auth.token.trim();
+          writeBrowserStorage('homekitui-token', null);
         }
       }
 
@@ -320,9 +372,12 @@ async function requestStoredAuthToken() {
 
 function clearStoredAuthToken() {
   sessionAuthToken = '';
-  window.localStorage.removeItem('homekitui-token');
+  writeBrowserStorage('homekitui-token', null);
 }
 
+/**
+ * @param {boolean} required True locks rendering and stops log streaming.
+ */
 function setAuthRequired(required) {
   state.authRequired = required === true;
 
@@ -385,6 +440,12 @@ async function authenticatedFetch(apiPath, options = {}) {
   return response;
 }
 
+/**
+ * @param {string} apiPath Same-origin JSON endpoint.
+ * @param {RequestInit} [options={}] Request method, headers, and body.
+ * @returns {Promise<*>} Parsed JSON; malformed JSON currently falls back to an empty object.
+ * @throws {Error} On transport, authentication cancellation, or unsuccessful HTTP status.
+ */
 async function api(apiPath, options = {}) {
   let response = await authenticatedFetch(apiPath, options);
   let data = await response.json().catch(() => ({}));
@@ -485,30 +546,23 @@ function render() {
     style.remove();
   }
 
-  document.getElementById('app').innerHTML = `
-    <aside>
-      ${pages
+  document.getElementById('app').innerHTML = (
+    '\n' + '    <aside>\n' + '      ' +
+    (pages
         .map(
-          (page) => `
-            <button
-              class="${state.page === page.id ? 'active' : ''}"
-              title="${escapeHTML(page.title)}"
-              aria-label="${escapeHTML(page.title)}"
-              data-page="${escapeHTML(page.id)}"
-            >
-              ${icon(page)}
-            </button>
-          `,
+          (page) => (
+            '\n' + '            <button\n' + '              class="' +
+            (state.page === page.id ? 'active' : '') + '"\n' + '              title="' + escapeHTML(page.title) + '"\n' +
+            '              aria-label="' + escapeHTML(page.title) + '"\n' + '              data-page="' + escapeHTML(page.id) + '"\n' +
+            '            >\n' + '              ' + icon(page) + '\n' + '            </button>\n' + '          '
+          ),
         )
-        .join('')}
-    </aside>
-
-    <main>
-      ${state.error !== undefined ? `<div class="error">${escapeHTML(state.error)}</div>` : ''}
-      ${state.page === 'status' ? statusPage() : ''}
-      ${state.page !== 'status' ? projectPage() : ''}
-    </main>
-  `;
+        .join('')) +
+    '\n' + '    </aside>\n' + '\n' + '    <main>\n' + '      ' +
+    (state.error !== undefined ? ('<div class="error">' + escapeHTML(state.error) + '</div>') : '') + '\n' + '      ' +
+    (state.page === 'status' ? statusPage() : '') + '\n' + '      ' +
+    (state.page !== 'status' ? projectPage() : '') + '\n' + '    </main>\n' + '  '
+  );
 
   renderLogsOnly(true);
   renderSchemaMount();
@@ -517,21 +571,16 @@ function render() {
 }
 
 function authRequiredPage() {
-  return `
-    <main class="auth-required-page">
-      <section class="auth-required-card">
-        <div class="auth-icon">${lockIcon()}</div>
-        <h1>Authentication required</h1>
-        <p>Enter the Web UI password to continue.</p>
-        <button class="primary" data-action="authenticate">Authenticate</button>
-      </section>
-    </main>
-  `;
+  return (
+    '\n' + '    <main class="auth-required-page">\n' + '      <section class="auth-required-card">\n' + '        <div class="auth-icon">' +
+    lockIcon() + '</div>\n' + '        <h1>Authentication required</h1>\n' + '        <p>Enter the Web UI password to continue.</p>\n' +
+    '        <button class="primary" data-action="authenticate">Authenticate</button>\n' + '      </section>\n' + '    </main>\n' + '  '
+  );
 }
 
 // Render schema-backed form content into the current page after the main
 // HTML has been written. The form renderer uses DOM nodes, so it cannot be
-// returned directly from the template string used by renderConfigPage().
+// returned directly from the HTML string used by renderConfigPage().
 function renderSchemaMount() {
   let mount = document.getElementById('schemaForm');
 
@@ -565,6 +614,12 @@ function renderSchemaMount() {
 
 // Generic schema-backed page renderer.
 // Dispatches to the correct renderer based on the schema type.
+/**
+ * @param {HTMLElement} container Form mount.
+ * @param {SchemaDefinition} schema Schema for the selected configuration section.
+ * @param {*} value Current configuration value.
+ * @param {(string|number)[]} [path=[]] Configuration path, including numeric array indexes.
+ */
 function renderSchemaPage(container, schema, value, path = []) {
   if (schema?.type === 'array') {
     return renderSchemaArray(container, schema, value, path);
@@ -579,6 +634,12 @@ function renderSchemaPage(container, schema, value, path = []) {
 
 // Render an array field from schema.items.
 // Object arrays are rendered as config cards, primitive arrays as compact fields.
+/**
+ * @param {HTMLElement} container Array mount.
+ * @param {SchemaDefinition} schema Array schema with a shared item definition.
+ * @param {*[]} [value=[]] Current entries.
+ * @param {(string|number)[]} path Configuration path to the array.
+ */
 function renderSchemaArray(container, schema, value = [], path) {
   if (schema?.items?.type !== 'object') {
     return renderPrimitiveArray(container, schema, value, path);
@@ -601,7 +662,7 @@ function renderSchemaArray(container, schema, value = [], path) {
     let title = document.createElement('div');
     title.className = 'config-card-title';
 
-    let displayName = typeof item?.name === 'string' && item.name.trim() !== '' ? item.name : `Item ${index + 1}`;
+    let displayName = typeof item?.name === 'string' && item.name.trim() !== '' ? item.name : ('Item ' + (index + 1));
 
     title.textContent = displayName;
 
@@ -628,6 +689,12 @@ function renderSchemaArray(container, schema, value = [], path) {
 
 // Render an array of primitive values as a single comma-separated field.
 // This keeps simple lists such as GPIO pins compact in the generated form.
+/**
+ * @param {HTMLElement} container Field mount.
+ * @param {SchemaDefinition} schema Array schema; numeric items use declared bounds.
+ * @param {*[]} [value=[]] Entries displayed as a comma-separated field.
+ * @param {(string|number)[]} path Configuration path to update.
+ */
 function renderPrimitiveArray(container, schema, value = [], path) {
   if (Array.isArray(value) === false) {
     value = value === undefined ? [] : [value];
@@ -683,6 +750,12 @@ function renderPrimitiveArray(container, schema, value = [], path) {
 
 // Render an object field from schema.properties.
 // Fields are rendered in schema order as generic form rows.
+/**
+ * @param {HTMLElement} container Object mount.
+ * @param {SchemaDefinition} schema Object property definitions.
+ * @param {Configuration} [value={}] Current object values.
+ * @param {(string|number)[]} path Configuration path to the object.
+ */
 function renderSchemaObject(container, schema, value = {}, path) {
   let props = schema?.properties || {};
 
@@ -701,6 +774,12 @@ function renderSchemaObject(container, schema, value = {}, path) {
 
 // Render a primitive schema field.
 // Supports enum/select, boolean/checkbox, number/integer, and string inputs.
+/**
+ * @param {HTMLElement} container Field mount.
+ * @param {SchemaDefinition} [schema={}] Type, enum, bounds, and password metadata.
+ * @param {*} value Current field value.
+ * @param {(string|number)[]} path Configuration path committed by control events.
+ */
 function renderSchemaField(container, schema = {}, value, path) {
   let label = document.createElement('div');
   label.className = 'list-title';
@@ -733,9 +812,10 @@ function renderSchemaField(container, schema = {}, value, path) {
   if (Array.isArray(schema.enum) === true) {
     input = document.createElement('select');
 
-    schema.enum.forEach((option) => {
+    schema.enum.forEach((option, index) => {
       let opt = document.createElement('option');
-      opt.value = option;
+      // DOM values are strings; indexes preserve the original JSON enum types.
+      opt.value = String(index);
       opt.textContent = option;
 
       if (option === value) {
@@ -806,8 +886,10 @@ function renderSchemaField(container, schema = {}, value, path) {
   let commit = () => {
     let newValue;
 
-    if (schema.type === 'boolean') {
-      newValue = input.checked;
+    if (Array.isArray(schema.enum) === true) {
+      newValue = structuredClone(schema.enum[Number(input.value)]);
+    } else if (schema.type === 'boolean') {
+      newValue = input.checked === true;
     } else if (schema.type === 'number' || schema.type === 'integer') {
       newValue = normaliseNumber(input.value);
       input.value = newValue ?? '';
@@ -830,6 +912,9 @@ function renderSchemaField(container, schema = {}, value, path) {
 }
 
 // Adds a new object entry to a schema-backed config array
+/**
+ * @param {string} schemaPath Dot path to an object array; each insertion owns its defaults.
+ */
 function addSchemaItem(schemaPath) {
   let path = schemaPath.split('.');
   let value = getSchemaPathValue(schemaPath);
@@ -846,99 +931,59 @@ function addSchemaItem(schemaPath) {
 
 // Status page combines HomeKit pairing cards, app actions, and logs
 function statusPage() {
-  return `
-    <div class="page-header">
-      <div>
-        <h1>Status</h1>
-        <div class="page-meta">
-          App v${escapeHTML(state.info.version || '')} •
-          UI v${escapeHTML(state.info.uiVersion || '')} •
-          Port ${escapeHTML(state.info.port || '')} •
-          Uptime <span class="uptime">${escapeHTML(formatUptime(uptimeSeconds))}</span>
-        </div>
-      </div>
-
-      <div class="page-actions">
-        <button title="Restart Service" data-action="restartService">
-          ${restartIcon()}
-        </button>
-
-        <button title="Backup Configuration" data-action="backupConfig">
-          ${downloadIcon()}
-        </button>
-      </div>
-    </div>
-
-    <div class="status-layout">
-      ${(state.homekit.accessories || [state.homekit]).map((accessory) => pairingCard(accessory)).join('')}
-    </div>
-
-    ${logsCard()}
-  `;
+  return (
+    '\n' + '    <div class="page-header">\n' + '      <div>\n' + '        <h1>Status</h1>\n' + '        <div class="page-meta">\n' +
+    '          App v' + escapeHTML(state.info.version || '') + ' •\n' + '          UI v' + escapeHTML(state.info.uiVersion || '') + ' •\n' +
+    '          Port ' + escapeHTML(state.info.port || '') + ' •\n' + '          Uptime <span class="uptime">' +
+    (escapeHTML(formatUptime(uptimeSeconds))) + '</span>\n' + '        </div>\n' + '      </div>\n' + '\n' +
+    '      <div class="page-actions">\n' + '        <button title="Restart Service" data-action="restartService">\n' + '          ' +
+    restartIcon() + '\n' + '        </button>\n' + '\n' + '        <button title="Backup Configuration" data-action="backupConfig">\n' +
+    '          ' + downloadIcon() + '\n' + '        </button>\n' + '      </div>\n' + '    </div>\n' + '\n' +
+    '    <div class="status-layout">\n' + '      ' +
+    ((state.homekit.accessories || [state.homekit]).map((accessory) => pairingCard(accessory)).join('')) + '\n' + '    </div>\n' + '\n' +
+    '    ' + logsCard() + '\n' + '  '
+  );
 }
 
 // HomeKit pairing information card
+/**
+ * @param {UIAccessoryDetails} [accessory=state.homekit] Backend pairing metadata.
+ * @returns {string} Pairing card HTML.
+ */
 function pairingCard(accessory = state.homekit) {
-  return `
-    <section class="pairing-card">
-      <div class="pairing-title">${escapeHTML(accessory.displayName || state.info.name || 'HomeKit Device')}</div>
-
-      <div class="pairing-content">
-        <div class="pairing-left">
-          ${
-            accessory.qrCode
-              ? `<img class="qr" src="${accessory.qrCode}" alt="HomeKit QR Code">`
-              : '<div class="qr-missing">QR unavailable</div>'
-          }
-
-          <div class="pin">${escapeHTML(accessory.pincode || '--- -- ---')}</div>
-
-          <div class="pairing-status">
-            <span class="hap-icon">${homeIcon()}</span>
-            <span>HAP</span>
-            <span>•</span>
-            <button
-              class="pairing-state ${accessory.paired === true ? 'paired' : 'unpaired'}"
-              title="${accessory.paired === true ? 'Reset HomeKit Pairing' : 'Not Paired'}"
-              ${
-                accessory.paired === true
-                  ? `data-action="resetPairing" data-username="${escapeHTML(accessory.username || '')}"`
-                  : 'disabled'
-              }
-              data-dynamic="pairing"
-            >
-              ${linkIcon()}
-            </button>
-          </div>
-
-          <div class="meta">${escapeHTML(accessory.username || '')}</div>
-        </div>
-      </div>
-    </section>
-  `;
+  return (
+    '\n' + '    <section class="pairing-card">\n' + '      <div class="pairing-title">' +
+    escapeHTML(accessory.displayName || state.info.name || 'HomeKit Device') + '</div>\n' + '\n' + '      <div class="pairing-content">\n' +
+    '        <div class="pairing-left">\n' + '          ' +
+    (accessory.qrCode
+              ? ('<img class="qr" src="' + (accessory.qrCode) + '" alt="HomeKit QR Code">')
+              : '<div class="qr-missing">QR unavailable</div>') +
+    '\n' + '\n' + '          <div class="pin">' + escapeHTML(accessory.pincode || '--- -- ---') + '</div>\n' + '\n' +
+    '          <div class="pairing-status">\n' + '            <span class="hap-icon">' + homeIcon() + '</span>\n' +
+    '            <span>HAP</span>\n' + '            <span>•</span>\n' + '            <button\n' + '              class="pairing-state ' +
+    (accessory.paired === true ? 'paired' : 'unpaired') + '"\n' + '              title="' +
+    (accessory.paired === true ? 'Reset HomeKit Pairing' : 'Not Paired') + '"\n' + '              ' +
+    (accessory.paired === true
+                  ? ('data-action="resetPairing" data-username="' + escapeHTML(accessory.username || '') + '"')
+                  : 'disabled') +
+    '\n' + '              data-dynamic="pairing"\n' + '            >\n' + '              ' + linkIcon() + '\n' + '            </button>\n' +
+    '          </div>\n' + '\n' + '          <div class="meta">' + escapeHTML(accessory.username || '') + '</div>\n' + '        </div>\n' +
+    '      </div>\n' + '    </section>\n' + '  '
+  );
 }
 
 // Logs card renders live log output
 function logsCard() {
-  return `
-    <section class="card logs-card">
-      <div class="logs-header">
-        <div class="logs-title">Log</div>
-
-        <div class="logs-controls">
-          <button id="logs-pause" title="Pause logs" data-action="togglePause">
-            ${logsPaused === true ? 'Live' : 'Pause'}
-          </button>
-          <button title="Clear logs" data-action="clearLogs">Clear</button>
-          <button id="logs-scroll" title="Toggle auto-scroll" data-action="toggleScroll">
-            ${logsAutoScroll === true ? 'Scroll' : 'Manual'}
-          </button>
-        </div>
-      </div>
-
-      <div id="logs" class="log-output"></div>
-    </section>
-  `;
+  return (
+    '\n' + '    <section class="card logs-card">\n' + '      <div class="logs-header">\n' + '        <div class="logs-title">Log</div>\n' +
+    '\n' + '        <div class="logs-controls">\n' + '          <button id="logs-pause" title="Pause logs" data-action="togglePause">\n' +
+    '            ' +
+    (logsPaused === true ? 'Live' : 'Pause') + '\n' + '          </button>\n' +
+    '          <button title="Clear logs" data-action="clearLogs">Clear</button>\n' +
+    '          <button id="logs-scroll" title="Toggle auto-scroll" data-action="toggleScroll">\n' + '            ' +
+    (logsAutoScroll === true ? 'Scroll' : 'Manual') + '\n' + '          </button>\n' + '        </div>\n' + '      </div>\n' + '\n' +
+    '      <div id="logs" class="log-output"></div>\n' + '    </section>\n' + '  '
+  );
 }
 
 // Project-specific page renderer.
@@ -971,39 +1016,32 @@ function projectPage() {
       }
     }
 
-    return `
-      <h1>${escapeHTML(page.title)}</h1>
-      ${data.html}
-    `;
+    return (
+      '\n' + '      <h1>' + escapeHTML(page.title) + '</h1>\n' + '      ' +
+      (data.html) + '\n' + '    '
+    );
   }
 
   // LIST page (inline rendering)
   if (data !== undefined && data !== null && data.type === 'list' && Array.isArray(data.items) === true) {
-    return `
-      <h1>${escapeHTML(page.title)}</h1>
-
-      <section class="card">
-        <div class="card-title">${escapeHTML(page.title)}</div>
-
-        <div class="list">
-          ${data.items
+    return (
+      '\n' + '      <h1>' + escapeHTML(page.title) + '</h1>\n' + '\n' + '      <section class="card">\n' +
+      '        <div class="card-title">' + escapeHTML(page.title) + '</div>\n' + '\n' + '        <div class="list">\n' + '          ' +
+      (data.items
             .map((item) => {
               // Render each row safely
-              return `
-                <div class="list-row">
-                  <div>
-                    <div class="list-title">${escapeHTML(item.title || '')}</div>
-                    <div class="list-sub">${escapeHTML(item.subtitle || '')}</div>
-                  </div>
-
-                  ${item.value !== undefined ? `<div class="list-value">${escapeHTML(String(item.value))}</div>` : ''}
-                </div>
-              `;
+              return (
+                '\n' + '                <div class="list-row">\n' + '                  <div>\n' +
+                '                    <div class="list-title">' + escapeHTML(item.title || '') + '</div>\n' +
+                '                    <div class="list-sub">' + escapeHTML(item.subtitle || '') + '</div>\n' + '                  </div>\n' +
+                '\n' + '                  ' +
+                (item.value !== undefined ? ('<div class="list-value">' + (escapeHTML(String(item.value))) + '</div>') : '') + '\n' +
+                '                </div>\n' + '              '
+              );
             })
-            .join('')}
-        </div>
-      </section>
-    `;
+            .join('')) +
+      '\n' + '        </div>\n' + '      </section>\n' + '    '
+    );
   }
 
   // Default: schema-driven config page
@@ -1012,6 +1050,10 @@ function projectPage() {
 
 // Generic config page renderer.
 // The actual schema-driven form is mounted later by renderSchemaMount().
+/**
+ * @param {UIPage} page Host page metadata selecting a configuration section.
+ * @returns {string} Configuration shell with a mount for DOM form controls.
+ */
 function renderConfigPage(page) {
   let addButton = '';
   let hasChanges = state.changedPaths.size > 0;
@@ -1021,37 +1063,28 @@ function renderConfigPage(page) {
     let schema = getSchemaAtPath(page.schemaPath);
 
     if (schema?.type === 'array' && schema?.items?.type === 'object') {
-      addButton = `<button class="secondary" data-action="addSchemaItem" data-path="${escapeHTML(page.schemaPath)}">+ Add</button>`;
+      addButton = ('<button class="secondary" data-action="addSchemaItem" data-path="' + escapeHTML(page.schemaPath) + '">+ Add</button>');
     }
   }
 
-  return `
-    <h1>${escapeHTML(page.title)}</h1>
-
-    <section class="card">
-      <div class="config-page-header">
-        <div class="card-description">Manage settings</div>
-
-        <div class="actions">
-          <button
-            id="save-config"
-            class="${hasChanges === true ? 'primary' : 'secondary'}"
-            ${saveInProgress === true || hasChanges !== true ? 'disabled' : ''}
-            data-action="saveConfig"
-          >
-            ${saveInProgress === true ? 'Saving…' : hasChanges === true ? 'Save Changes' : 'No Changes'}
-          </button>
-
-          ${addButton}
-        </div>
-      </div>
-
-      <div id="schemaForm"></div>
-    </section>
-  `;
+  return (
+    '\n' + '    <h1>' + escapeHTML(page.title) + '</h1>\n' + '\n' + '    <section class="card">\n' +
+    '      <div class="config-page-header">\n' + '        <div class="card-description">Manage settings</div>\n' + '\n' +
+    '        <div class="actions">\n' + '          <button\n' + '            id="save-config"\n' + '            class="' +
+    (hasChanges === true ? 'primary' : 'secondary') + '"\n' + '            ' +
+    (saveInProgress === true || hasChanges !== true ? 'disabled' : '') + '\n' + '            data-action="saveConfig"\n' + '          >\n' +
+    '            ' +
+    (saveInProgress === true ? 'Saving…' : hasChanges === true ? 'Save Changes' : 'No Changes') + '\n' + '          </button>\n' + '\n' +
+    '          ' + addButton + '\n' + '        </div>\n' + '      </div>\n' + '\n' + '      <div id="schemaForm"></div>\n' +
+    '    </section>\n' + '  '
+  );
 }
 
 // Change active page and load data/config if required
+/**
+ * @param {string} page Built-in status ID or configured project page ID.
+ * @returns {Promise<void>} Resolves after page loading and rendering.
+ */
 async function setPage(page) {
   let logs = document.getElementById('logs');
 
@@ -1088,19 +1121,30 @@ async function setPage(page) {
 }
 
 // Load dynamic page data from backend
+/**
+ * @param {string} pageId Configured host page ID.
+ * @returns {Promise<void>} Updates the payload and clears errors on success; preserves the payload on ordinary failure.
+ * @throws {Error} When authentication is cancelled.
+ */
 async function loadPageData(pageId) {
   try {
-    state.pageData[pageId] = await api(`/api/page/${pageId}`);
+    state.pageData[pageId] = await api(('/api/page/' + pageId));
+    state.error = undefined;
   } catch (error) {
     if (isAuthRequiredError(error) === true) {
       throw error;
     }
 
-    state.pageData[pageId] = undefined;
+    // Preserve the last successful payload so transient failures leave useful state.
+    state.error = String(error.message || error);
   }
 }
 
 // Load config + schema from backend
+/**
+ * @param {boolean} [doRender=true] Whether to render after loading configuration and schemas.
+ * @returns {Promise<void>} Records ordinary load failures; rejects authentication cancellation.
+ */
 async function loadConfig(doRender = true) {
   try {
     state.config = await api('/api/config');
@@ -1250,6 +1294,11 @@ async function backupConfig() {
 // Actions are intentionally generic so HomeKitUI does not need to know
 // about project-specific concepts such as irrigation zones, cameras,
 // locks, weather systems, or garage doors.
+/**
+ * @param {string} action Host-defined command ID.
+ * @param {Object<string, *>} [data={}] Host-defined command parameters.
+ * @returns {Promise<void>} Dispatches for the active page, refreshes its data, and reports errors.
+ */
 async function sendAction(action, data = {}) {
   try {
     // Ignore invalid action requests.
@@ -1371,6 +1420,10 @@ function startLogStream() {
 }
 
 // Reload current log history from backend
+/**
+ * @param {boolean} [scroll=true] Whether the refreshed log view may auto-scroll.
+ * @returns {Promise<void>} Updates history; transient failures preserve it and authentication cancellation rejects.
+ */
 async function loadLogs(scroll = true) {
   try {
     state.logs = (await api('/api/logs')).logs || [];
@@ -1385,6 +1438,9 @@ async function loadLogs(scroll = true) {
 }
 
 // Append a single live log entry without re-rendering the full page
+/**
+ * @param {UILogEntry} entry Backend log record; HTML comes from backend ANSI conversion.
+ */
 function appendLog(entry) {
   if (logsPaused === true) {
     return;
@@ -1414,6 +1470,9 @@ function appendLog(entry) {
 }
 
 // Render current log history into the log output element
+/**
+ * @param {boolean} [scroll=true] Whether to auto-scroll when automatic scrolling is enabled.
+ */
 function renderLogsOnly(scroll = true) {
   let logs = document.getElementById('logs');
 
@@ -1535,6 +1594,9 @@ function startRuntimeTimer() {
 }
 
 // Apply optional project-provided theme colours
+/**
+ * @param {UITheme} theme Optional host colours applied to shell CSS variables.
+ */
 function applyTheme(theme) {
   if (theme === null || typeof theme !== 'object') {
     return;
@@ -1601,6 +1663,9 @@ function toggleScroll() {
 
 // Toggle a project-provided collapsible section.
 // Open state is stored so dynamic page refreshes and browser refreshes can re-apply it.
+/**
+ * @param {string} id DOM ID of the project panel whose state is remembered.
+ */
 function toggleCollapse(id) {
   let element = document.getElementById(id);
 
@@ -1615,11 +1680,11 @@ function toggleCollapse(id) {
   }
 
   state.collapse[id] = state.collapse[id] === true ? false : true;
-  window.localStorage.setItem(storageKey, state.collapse[id] === true ? 'true' : 'false');
+  writeBrowserStorage(storageKey, state.collapse[id] === true ? 'true' : 'false');
 
   element.classList.toggle('open', state.collapse[id] === true);
 
-  document.querySelectorAll(`[data-target="${id}"]`).forEach((button) => {
+  document.querySelectorAll(('[data-target="' + (id) + '"]')).forEach((button) => {
     button.classList.toggle('open', state.collapse[id] === true);
   });
 
@@ -1638,7 +1703,7 @@ function restoreCollapseState() {
     }
 
     let storageKey = 'homekitui-collapse-' + state.page + '-' + element.id;
-    let storedValue = window.localStorage.getItem(storageKey);
+    let storedValue = readBrowserStorage(storageKey);
 
     if (storedValue !== null) {
       state.collapse[element.id] = storedValue === 'true';
@@ -1650,7 +1715,7 @@ function restoreCollapseState() {
     element.classList.toggle('open', isOpen);
 
     // Restore matching toggle buttons
-    document.querySelectorAll(`[data-target="${element.id}"]`).forEach((button) => {
+    document.querySelectorAll(('[data-target="' + (element.id) + '"]')).forEach((button) => {
       button.classList.toggle('open', isOpen);
     });
   });
@@ -1658,6 +1723,11 @@ function restoreCollapseState() {
 
 // Apply visible-switch state for one control.
 // Used by trusted project pages for simple frontend-only view switching.
+/**
+ * @param {HTMLSelectElement|HTMLInputElement} control Project control with data-target-group.
+ * @param {string} value Selected visibility value; nullish values use the control value.
+ * @param {boolean} [persist=false] Whether to remember this selection across reloads when storage permits.
+ */
 function applyVisibleState(control, value, persist = false) {
   if (control === null || control === undefined) {
     return;
@@ -1676,7 +1746,7 @@ function applyVisibleState(control, value, persist = false) {
   control.value = selectedValue;
 
   if (persist === true) {
-    window.localStorage.setItem(storageKey, selectedValue);
+    writeBrowserStorage(storageKey, selectedValue);
   }
 
   let root = control.closest('[data-visible-root]') || document;
@@ -1703,7 +1773,7 @@ function restoreVisibleState() {
     let value = state.visible[group];
 
     if (value === undefined) {
-      value = window.localStorage.getItem(storageKey);
+      value = readBrowserStorage(storageKey);
     }
 
     if (value === null || value === undefined) {
@@ -1715,6 +1785,10 @@ function restoreVisibleState() {
 }
 
 // Format uptime seconds into short display string
+/**
+ * @param {number} seconds Process uptime in seconds.
+ * @returns {string} Days, hours, minutes, and seconds for display.
+ */
 function formatUptime(seconds) {
   if (Number.isFinite(Number(seconds)) === false) {
     return '';
@@ -1747,6 +1821,10 @@ async function restartService() {
 //
 // Multi-accessory projects pass the accessory username explicitly.
 // Single-accessory projects fall back to the primary HomeKit accessory.
+/**
+ * @param {string} [username=state.homekit.username] HAP identifier of the selected accessory.
+ * @returns {Promise<void>} Requests confirmed cleanup; API failures reject.
+ */
 async function resetPairing(username = state.homekit.username) {
   // Pairing reset is destructive and requires the accessory to be
   // re-added in Apple Home or another HomeKit controller.
@@ -1767,6 +1845,10 @@ async function resetPairing(username = state.homekit.username) {
 }
 
 // Safely get nested config path
+/**
+ * @param {string} schemaPath Dot path; empty or undefined selects the root configuration.
+ * @returns {*} Selected value, or undefined for a missing path.
+ */
 function getSchemaPathValue(schemaPath) {
   if (schemaPath === undefined || schemaPath === '') {
     return state.config;
@@ -1784,6 +1866,12 @@ function getSchemaPathValue(schemaPath) {
 // Download a backend-generated file using authenticated fetch.
 // Normal browser links cannot include Authorisation headers, so protected
 // downloads must be fetched first and then saved via a temporary object URL.
+/**
+ * @param {string} apiPath Same-origin download endpoint.
+ * @param {string} filename Browser download filename.
+ * @returns {Promise<void>} Downloads an authenticated response and releases its object URL.
+ * @throws {Error} On authentication cancellation, transport, or HTTP failure.
+ */
 async function downloadAPI(apiPath, filename) {
   let response = await authenticatedFetch(apiPath);
 
@@ -1832,6 +1920,10 @@ function updateSaveButton() {
 }
 
 // Escape HTML safely
+/**
+ * @param {*} value Value converted to text; nullish values become an empty string.
+ * @returns {string} Text escaped for HTML content and quoted attributes.
+ */
 function escapeHTML(value) {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -1842,11 +1934,21 @@ function escapeHTML(value) {
 }
 
 // Restrict dynamic class names to safe characters
+/**
+ * @param {*} value Dynamic CSS class suffix.
+ * @returns {string} Only alphanumeric, underscore, and hyphen characters.
+ */
 function escapeClassName(value) {
   return String(value ?? '').replaceAll(/[^a-zA-Z0-9_-]/g, '');
 }
 
 // Safely set value in nested object using path
+/**
+ * @param {Configuration} obj Mutable configuration model.
+ * @param {(string|number)[]} path Non-empty path; numbers select array entries.
+ * @param {*} value New field value.
+ * @returns {void} Mutates the model, tracks the path and revision, and updates the save button.
+ */
 function setValueAtPath(obj, path, value) {
   let ref = obj;
 
@@ -1871,9 +1973,14 @@ function setValueAtPath(obj, path, value) {
 }
 
 // Create a default config value from a schema definition
+/**
+ * @param {SchemaDefinition} schema Schema whose explicit defaults or type determine a new value.
+ * @returns {*} Independently owned default, generated object/array/boolean, first enum value, or undefined.
+ */
 function getDefaultValue(schema) {
   if (schema?.default !== undefined) {
-    return schema.default;
+    // Each inserted item owns its defaults; edits must not mutate sibling items or schema.
+    return structuredClone(schema.default);
   }
 
   if (schema?.type === 'object') {
@@ -1894,8 +2001,8 @@ function getDefaultValue(schema) {
     return false;
   }
 
-  if (Array.isArray(schema?.enum)) {
-    return schema.enum[0];
+  if (Array.isArray(schema?.enum) === true) {
+    return structuredClone(schema.enum[0]);
   }
 
   return undefined;
@@ -1904,6 +2011,10 @@ function getDefaultValue(schema) {
 // Resolve a nested schema section from the root JSON schema using a dot path
 // (e.g. "doors", "options.something"). This mirrors getSchemaPathValue()
 // but operates on the schema definition instead of the config data.
+/**
+ * @param {string} schemaPath Dot path; array indexes resolve through the shared items schema.
+ * @returns {SchemaDefinition|undefined} Matching schema, or the root for an empty or undefined path.
+ */
 function getSchemaAtPath(schemaPath) {
   if (schemaPath === undefined || schemaPath === '') {
     return state.schema;
@@ -1923,6 +2034,10 @@ function getSchemaAtPath(schemaPath) {
 }
 
 // Icon mapping
+/**
+ * @param {UIPage} page Host icon name or SVG metadata.
+ * @returns {string} Allowed SVG markup, a built-in icon, or the default dot.
+ */
 function icon(page) {
   if (typeof page?.svg === 'string' && page.svg.length <= 5000 && page.svg.trim() !== '' && page.svg.includes('<svg') === true) {
     try {

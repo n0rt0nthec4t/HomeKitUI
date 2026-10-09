@@ -685,7 +685,7 @@ async function browserFixture(options = {}) {
       createObjectURL: (blob) => { downloads.push({ blob, revoked: false }); return 'blob:fixture'; },
       revokeObjectURL: () => { downloads.at(-1).revoked = true; },
     },
-    localStorage: {
+    localStorage: options.localStorage ?? {
       getItem: (key) => storage.get(key) ?? null,
       setItem: (key, value) => storage.set(key, String(value)),
       removeItem: (key) => storage.delete(key),
@@ -727,7 +727,7 @@ async function browserFixture(options = {}) {
   };
   context = createContext({ window, document, fetch, EventSource: MockEventSource,
     alert: (message) => alerts.push(String(message)), confirm: () => options.confirm !== false,
-    DOMParser: options.DOMParser,
+    DOMParser: options.DOMParser, structuredClone,
     setTimeout: window.setTimeout, clearTimeout: window.clearTimeout });
   runInContext(script, context);
   await setImmediate();
@@ -775,6 +775,11 @@ test('schema controls commit booleans, bounded integers, enums and primitive arr
     [{ type: 'integer', minimum: 1, maximum: 10 }, 2, '-3', 1],
     [{ type: 'boolean' }, true, false, false],
     [{ type: 'string', enum: ['auto', 'manual'] }, 'auto', 'manual', 'manual'],
+    [{ type: 'boolean', enum: [false, true] }, false, true, true],
+    [{ type: 'boolean', enum: [false, true] }, true, false, false],
+    [{ type: 'integer', enum: [2, 4] }, 2, 4, 4],
+    [{ enum: [1, '1', null] }, 1, '1', '1'],
+    [{ enum: [1, '1', null] }, 1, null, null],
   ]) {
     f.evaluate('state.config.field = ' + JSON.stringify(value));
     const container = new MockElement('div');
@@ -782,7 +787,9 @@ test('schema controls commit booleans, bounded integers, enums and primitive arr
     const render = f.evaluate('(container, schema) => renderSchemaField(container, JSON.parse(schema), state.config.field, ["field"])');
     render(container, JSON.stringify(schema));
     const input = container.children.at(-1);
-    if (schema.type === 'boolean') {
+    if (Array.isArray(schema.enum) === true) {
+      input.value = String(schema.enum.indexOf(inputValue));
+    } else if (schema.type === 'boolean') {
       input.checked = inputValue;
     } else {
       input.value = inputValue;
@@ -1359,4 +1366,116 @@ test('cached console method references remain callable after capture is released
   const captured = console.info;
   await f.ui.stop();
   assert.doesNotThrow(() => captured('homekitui-cached-console-regression'));
+});
+
+test('new array items own nested defaults without mutating siblings or schema', async () => {
+  const f = await browserFixture();
+  await f.evaluate('loadConfig(false)');
+  f.evaluate('state.config.zones = []; state.schema.properties.zones.items.default = {name:"New",settings:{pins:[1,2]}}');
+  f.evaluate('addSchemaItem("zones"); addSchemaItem("zones")');
+  f.evaluate('setValueAtPath(state.config, ["zones",0,"name"], "Edited"); state.config.zones[0].settings.pins.push(3)');
+  assert.deepEqual(f.snapshot('state.config.zones[1]'), { name: 'New', settings: { pins: [1, 2] } });
+  assert.deepEqual(f.snapshot('state.schema.properties.zones.items.default'), { name: 'New', settings: { pins: [1, 2] } });
+  assert.equal(f.evaluate('state.changedPaths.has("zones.0.name")'), true);
+});
+
+test('structured enum defaults and committed values do not alias the schema', async () => {
+  const f = await browserFixture();
+  f.evaluate('state.schema.choice = {enum:[{name:"New"}]}');
+  f.evaluate('let enumDefault = getDefaultValue(state.schema.choice); enumDefault.name = "Changed"');
+  assert.equal(f.evaluate('state.schema.choice.enum[0].name'), 'New');
+  const container = new MockElement('div');
+  f.evaluate('(container) => renderSchemaField(container, state.schema.choice, undefined, ["choice"])')(container);
+  container.children.at(-1).value = '0';
+  container.children.at(-1).onchange();
+  f.evaluate('state.config.choice.name = "Edited"');
+  assert.equal(f.evaluate('state.schema.choice.enum[0].name'), 'New');
+});
+
+test('denied storage leaves startup, API requests and session preferences usable', async () => {
+  const f = await browserFixture({ localStorage: {
+    getItem() { throw new Error('Storage denied'); },
+    setItem() { throw new Error('Storage denied'); },
+    removeItem() { throw new Error('Storage denied'); },
+  } });
+  assert.equal(f.evaluate('state.error'), undefined);
+  assert.equal(f.streams.length, 1);
+  await f.evaluate('api("/api/config")');
+  assert.equal(f.requests.at(-1).path, '/api/config');
+  assert.equal(f.evaluate('writeBrowserStorage("homekitui-collapse-dashboard-panel", "true")'), false);
+  assert.equal(f.evaluate('readBrowserStorage("homekitui-collapse-dashboard-panel")'), 'true');
+  assert.equal(f.evaluate('writeBrowserStorage("homekitui-visible-dashboard-group", "selected")'), false);
+  assert.equal(f.evaluate('readBrowserStorage("homekitui-visible-dashboard-group")'), 'selected');
+  f.evaluate('render()');
+});
+
+test('denied token persistence retries authentication and reports tab-only credentials', async () => {
+  const f = await browserFixture();
+  f.evaluate('window.localStorage.setItem = () => { throw new Error("Storage full"); }');
+  f.responses['/api/protected'] = { fixtureStatus: 401, payload: { error: 'Authentication required' } };
+  const pending = f.evaluate('api("/api/protected")');
+  await setImmediate();
+  const overlay = f.body.children.at(-1);
+  overlay.querySelector('.auth-input').value = 'tab-token';
+  overlay.querySelector('[data-auth-remember]').checked = true;
+  f.responses['/api/protected'] = { success: true };
+  overlay.querySelector('[data-auth-form]').onsubmit({ preventDefault() {}, stopPropagation() {} });
+  await pending;
+  assert.equal(f.requests.at(-1).options.headers.Authorization, 'Bearer tab-token');
+  assert.equal(f.evaluate('authToken()'), 'tab-token');
+  assert.equal(f.storage.has('homekitui-token'), false);
+  assert.match(f.alerts.at(-1), /kept for this tab only/);
+});
+
+test('denied token removal cannot resurrect stale remembered credentials', async () => {
+  const f = await browserFixture();
+  f.storage.set('homekitui-token', 'stale-token');
+  assert.equal(f.evaluate('authToken()'), 'stale-token');
+  f.evaluate('window.localStorage.removeItem = () => { throw new Error("Removal denied"); }');
+  f.evaluate('clearStoredAuthToken()');
+  assert.equal(f.evaluate('authToken()'), '');
+  assert.equal(f.storage.get('homekitui-token'), 'stale-token');
+  const pending = f.evaluate('requestStoredAuthToken()');
+  const overlay = f.body.children.at(-1);
+  overlay.querySelector('.auth-input').value = 'new-session-token';
+  overlay.querySelector('[data-auth-form]').onsubmit({ preventDefault() {}, stopPropagation() {} });
+  await pending;
+  assert.equal(f.evaluate('authToken()'), 'new-session-token');
+  f.evaluate('clearStoredAuthToken()');
+  assert.equal(f.evaluate('authToken()'), '');
+});
+
+test('failed page loads preserve the last payload and render an actionable error', async () => {
+  const f = await browserFixture({ responses: {
+    '/api/info': { pages: [{ id: 'dashboard', title: 'Dashboard' }] },
+    '/api/page/dashboard': { type: 'list', items: [{ title: 'Known state' }] },
+  } });
+  await f.evaluate('setPage("dashboard")');
+  const previous = f.snapshot('state.pageData.dashboard');
+  f.responses['/api/page/dashboard'] = { fixtureStatus: 500, payload: { error: 'Host page failed' } };
+  await f.evaluate('setPage("dashboard")');
+  assert.deepEqual(f.snapshot('state.pageData.dashboard'), previous);
+  assert.match(f.app.innerHTML, /Host page failed/);
+  assert.match(f.app.innerHTML, /Known state/);
+  f.responses['/api/page/dashboard'] = { type: 'list', items: [{ title: 'Recovered state' }] };
+  await f.evaluate('setPage("dashboard")');
+  assert.equal(f.evaluate('state.error'), undefined);
+  assert.match(f.app.innerHTML, /Recovered state/);
+});
+
+test('transport failures preserve page payload and authentication cancellation still rejects', async () => {
+  const f = await browserFixture();
+  f.evaluate('state.pageData.dashboard = {type:"list",items:[{title:"Known state"}]}');
+  f.evaluate('fetch = async () => { throw new Error("Network offline"); }');
+  await f.evaluate('loadPageData("dashboard")');
+  assert.equal(f.evaluate('state.pageData.dashboard.items[0].title'), 'Known state');
+  assert.equal(f.evaluate('state.error'), 'Network offline');
+  f.evaluate('fetch = async () => ({status:401})');
+  const pending = f.evaluate('loadPageData("dashboard")');
+  const rejection = assert.rejects(pending, /Authentication required/);
+  await setImmediate();
+  f.body.children.at(-1).querySelector('[data-auth-cancel]').onclick({ preventDefault() {}, stopPropagation() {} });
+  await rejection;
+  assert.equal(f.evaluate('state.authRequired'), true);
+  assert.equal(f.evaluate('state.pageData.dashboard.items[0].title'), 'Known state');
 });

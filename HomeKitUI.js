@@ -112,6 +112,39 @@ const LOG_LEVELS = {
  */
 
 /**
+ * @typedef {object} UIHTMLPageData
+ * @property {'html'} type Renderer selection; requires a trustedHTML page.
+ * @property {string} html Host-owned page markup.
+ * @property {string} [css] Optional host-owned stylesheet.
+ */
+
+/**
+ * @typedef {object} UIListItem
+ * @property {string} [title] Escaped row title.
+ * @property {string} [subtitle] Escaped secondary text.
+ * @property {*} [value] Optional value displayed as escaped text.
+ */
+
+/**
+ * @typedef {object} UIListPageData
+ * @property {'list'} type Renderer selection.
+ * @property {UIListItem[]} items Rows displayed in order.
+ */
+
+/**
+ * @typedef {UIHTMLPageData|UIListPageData|Object<string, *>} UIPageData
+ * Known renderer payloads or host data that falls back to the configuration shell.
+ */
+
+/**
+ * @typedef {object} UITheme
+ * @property {string} [accent] CSS accent colour.
+ * @property {string} [accentLight] CSS light accent colour.
+ * @property {string} [background] CSS shell background colour.
+ * @property {string} [card] CSS card background colour.
+ */
+
+/**
  * @typedef {object} UIAccessory
  * @property {string} [displayName] Accessory label.
  * @property {string} [username] HAP accessory identifier.
@@ -133,6 +166,18 @@ const LOG_LEVELS = {
  */
 
 /**
+ * @typedef {object} UIAccessoryDetails
+ * @property {string} [displayName] Accessory label.
+ * @property {string} [username] HAP identifier used for pairing reset.
+ * @property {string} [pincode] Setup code.
+ * @property {string} [setupID] HAP setup identifier.
+ * @property {string} [setupURI] HAP setup URI.
+ * @property {string} [qrCode] PNG data URL encoding the setup URI.
+ * @property {boolean} paired Whether the HAP metadata reports a pairing.
+ * @property {object[]} pairings HAP pairing entries, or an empty list if unavailable.
+ */
+
+/**
  * @typedef {object} HomeKitUIOptions
  * @property {string} [name='HomeKit Device'] Application name.
  * @property {string} [version] Application version; defaults to HomeKitUI.VERSION.
@@ -142,15 +187,15 @@ const LOG_LEVELS = {
  * @property {string} [configFile] Configuration path for reads and default writes.
  * @property {string} [schemaFile] JSON Schema path.
  * @property {string} [uiSchemaFile] Optional UI schema path.
- * @property {Object<string, string>} [theme] Browser theme colours.
+ * @property {UITheme} [theme] Browser theme colours.
  * @property {UIPage[]} [pages=[]] Project page definitions.
  * @property {UIAccessory} [accessory] Single-accessory fallback.
  * @property {UIAccessory[]} [accessories=[]] Published accessories.
  * @property {{Accessory?: {cleanupAccessoryData: function(string): void}}} [hap] HAP cleanup API.
  * @property {Object<string, function>} [log] Host logger with level methods.
  * @property {{source?: string, file?: string, unit?: string, lines?: number}} [logs] Log source and bounded history.
- * @property {function(string): (object|Promise<object>)} [onGetPage] Project renderer payload provider.
- * @property {function(string, object, string=): (void|Promise<void>)} [onAction] Project action dispatcher.
+ * @property {function(string): (UIPageData|Promise<UIPageData>)} [onGetPage] Project renderer payload provider.
+ * @property {function(string, Object<string, *>, string=): (void|Promise<void>)} [onAction] Project action dispatcher.
  * @property {function(Configuration): (void|Promise<void>)} [onValidateConfig] Throw/reject to block persistence.
  * @property {function(Configuration): (void|Promise<void>)} [onSaveConfig] Replace the default save write.
  * @property {function(Configuration): (void|Promise<void>)} [onRestoreConfig] Replace the default restore write.
@@ -158,10 +203,18 @@ const LOG_LEVELS = {
  * @property {function(string, UIAccessory=): (void|Promise<void>)} [onResetPairing] Host reset policy.
  */
 
-// Define our HomeKit UI class
+/**
+ * Shared web management interface for standalone HAP-NodeJS applications.
+ *
+ * HomeKitUI owns the HTTP server, built-in browser interface, API authentication,
+ * configuration persistence, project page dispatch, pairing metadata, and log delivery.
+ * Host applications supply configuration paths, schemas, published accessories,
+ * and optional validation, persistence, action, restart, and pairing-reset hooks.
+ * Construct one instance per process and use start() and stop() to manage its lifecycle.
+ */
 export default class HomeKitUI {
   static DEFAULT_PORT = 8581;
-  static VERSION = '2026.10.06';
+  static VERSION = '2026.10.09';
 
   // Console capture state for the single management instance
   static DEFAULT_CONSOLE_HISTORY_LINES = 500;

@@ -2,6 +2,21 @@
 
 All notable changes to the `HomeKitUI` module are documented in this file.
 
+## 2026/10/09
+
+### Fixed
+
+- Preserved JSON types for enum controls, including boolean choices.
+- Copied structured defaults and enum values so new items cannot mutate siblings or schema definitions.
+- Kept credentials and UI preferences usable in memory when browser storage fails, with feedback when a password cannot be remembered.
+- Preserved the last successful project payload and displayed page load failures; successful reloads clear the error.
+
+### Changed
+
+- Replaced frontend template literals with explicit string concatenation and made the remaining implicit boolean check explicit.
+- Documented shared frontend contracts and host page payloads with reusable JSDoc types.
+- Updated module and frontend code dates to `2026.10.09`.
+
 ## 2026/10/06
 
 ### Added
